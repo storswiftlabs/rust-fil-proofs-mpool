@@ -51,17 +51,17 @@ MEM_POOL_SIZE = (3 * N + 1) * SECTOR_SIZE / 2
 // count = 512M/32M * (3*6+1)/2 = 16 * 19 / 2 = 152
 //
 pub struct LabelPool {
-pub sector:     usize,
-pub tasks:      usize,
-pub block:      usize,
-pub count:      usize,
-pub total:      usize,
-
-pub maxidx:     usize,
-pub tidmap:     HashMap<ThreadId, usize>,
-pub idxmap:     Vec<usize>,
-pub banks:      Vec<usize>,
-pub pool:       Vec<u8>,
+    pub sector:     usize,
+    pub tasks:      usize,
+    pub block:      usize,
+    pub count:      usize,
+    pub total:      usize,
+    
+    pub maxidx:     usize,
+    pub tidmap:     HashMap<ThreadId, usize>,
+    pub idxmap:     Vec<usize>,
+    pub banks:      Vec<usize>,
+    pub pool:       Vec<u8>,
 }
 
 ```
