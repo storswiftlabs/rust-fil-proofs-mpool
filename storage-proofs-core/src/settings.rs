@@ -30,6 +30,11 @@ pub struct Settings {
     pub multicore_sdr_producers: usize,
     pub multicore_sdr_producer_stride: u64,
     pub multicore_sdr_lookahead: usize,
+
+    pub use_mpool: bool,
+    pub p1_tasks: usize,
+    pub p1_total: usize,
+    pub p1_block: usize,
 }
 
 impl Default for Settings {
@@ -54,6 +59,11 @@ impl Default for Settings {
             multicore_sdr_producers: 3,
             multicore_sdr_producer_stride: 128,
             multicore_sdr_lookahead: 800,
+
+            use_mpool: false,
+            p1_tasks: 29,
+            p1_total: 1430,
+            p1_block: 1_073_741_824,
         }
     }
 }
