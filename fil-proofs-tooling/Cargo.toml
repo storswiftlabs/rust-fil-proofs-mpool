@@ -1,7 +1,7 @@
 [package]
 name = "fil-proofs-tooling"
 description = "Tooling for rust-fil-proofs"
-version = "9.1.0"
+version = "10.0.0"
 authors = ["dignifiedquire <dignifiedquire@gmail.com>"]
 license = "MIT OR Apache-2.0"
 publish = false
@@ -10,9 +10,10 @@ repository = "https://github.com/filecoin-project/rust-fil-proofs"
 readme = "README.md"
 
 [dependencies]
-storage-proofs-core = { path = "../storage-proofs-core", version = "^10.0.0", default-features = false}
-storage-proofs-porep = { path = "../storage-proofs-porep", version = "^10.0.0", default-features = false }
-storage-proofs-post = { path = "../storage-proofs-post", version = "^10.0.0", default-features = false }
+storage-proofs-core = { path = "../storage-proofs-core", version = "^11.0.0", default-features = false}
+storage-proofs-porep = { path = "../storage-proofs-porep", version = "^11.0.0", default-features = false }
+storage-proofs-post = { path = "../storage-proofs-post", version = "^11.0.0", default-features = false }
+storage-proofs-update = { path = "../storage-proofs-update", version = "^11.0.0", default-features = false }
 filecoin-proofs = { path = "../filecoin-proofs", default-features = false }
 filecoin-hashers = { path = "../filecoin-hashers", default-features = false, features = ["poseidon", "blake2s", "sha256"] }
 clap = "2"
@@ -59,6 +60,7 @@ cuda = [
     "storage-proofs-core/cuda",
     "storage-proofs-porep/cuda",
     "storage-proofs-post/cuda",
+    "storage-proofs-update/cuda",
     "filecoin-proofs/cuda",
     "bellperson/cuda",
     "filecoin-hashers/cuda",
@@ -67,6 +69,7 @@ opencl = [
     "storage-proofs-core/opencl",
     "storage-proofs-porep/opencl",
     "storage-proofs-post/opencl",
+    "storage-proofs-update/opencl",
     "filecoin-proofs/opencl",
     "bellperson/opencl",
     "filecoin-hashers/opencl",

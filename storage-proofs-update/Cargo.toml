@@ -1,8 +1,8 @@
 [package]
-name = "storage-proofs-porep"
+name = "storage-proofs-update"
 version = "11.0.0"
 authors = ["dignifiedquire <me@dignifiedquire.com>"]
-description = "Proofs of replication"
+description = "Proof of SDR-PoRep CC-Sector Update"
 license = "MIT OR Apache-2.0"
 edition = "2018"
 repository = "https://github.com/filecoin-project/rust-fil-proofs"
@@ -12,6 +12,7 @@ readme = "README.md"
 crossbeam = "0.8"
 digest = "0.9"
 storage-proofs-core = { path = "../storage-proofs-core", version = "^11.0.0", default-features = false}
+storage-proofs-porep = { path = "../storage-proofs-porep", version = "^11.0.0", default-features = false}
 sha2raw = { path = "../sha2raw", version = "^6.0.0"}
 filecoin-hashers = { path = "../filecoin-hashers", version = "^6.0.0", default-features = false, features = ["poseidon", "sha256"]}
 rand = "0.8"
@@ -24,6 +25,7 @@ serde = { version = "1.0", features = ["derive"]}
 serde_json = "1.0"
 ff = "0.11.0"
 bellperson = "0.18.0"
+blstrs = "0.4.0"
 log = "0.4.7"
 pretty_assertions = "0.6.1"
 generic-array = "0.14.4"
@@ -41,8 +43,7 @@ fdlimit = "0.2.0"
 fr32 = { path = "../fr32", version = "^4.0.0", default-features = false }
 yastl = "0.1.2"
 fil_logger = "0.1"
-pairing = "0.21"
-blstrs = "0.4.0"
+memmap = "0.7"
 
 [target."cfg(target_arch = \"aarch64\")".dependencies]
 sha2 = { version = "0.9.3", features = ["compress", "asm"] }
@@ -56,18 +57,27 @@ criterion = "0.3.2"
 glob = "0.3.0"
 pretty_env_logger = "0.4.0"
 filecoin-hashers = { path = "../filecoin-hashers", version = "^6.0.0", default-features = false, features = ["poseidon", "sha256", "blake2s"]}
+storage-proofs-porep = { path = "../storage-proofs-porep", version = "^11.0.0", default-features = false }
 
 [features]
 default = ["opencl", "multicore-sdr"]
-cuda = ["storage-proofs-core/cuda", "filecoin-hashers/cuda", "neptune/cuda", "bellperson/cuda", "fr32/cuda"]
-opencl = ["storage-proofs-core/opencl", "filecoin-hashers/opencl", "neptune/opencl", "bellperson/opencl", "fr32/opencl"]
 isolated-testing = []
-multicore-sdr = ["hwloc"]
-
-[[bench]]
-name = "encode"
-harness = false
-
-[[bench]]
-name = "parents"
-harness = false
+opencl = [
+    "storage-proofs-core/opencl",
+    "storage-proofs-porep/opencl",
+    "filecoin-hashers/opencl",
+    "neptune/opencl",
+    "bellperson/opencl",
+    "fr32/opencl",
+]
+cuda = [
+    "storage-proofs-core/cuda",
+    "storage-proofs-porep/cuda",
+    "filecoin-hashers/cuda",
+    "neptune/cuda",
+    "bellperson/cuda",
+    "fr32/cuda",
+]
+multicore-sdr = [
+    "storage-proofs-porep/multicore-sdr",
+]
