@@ -61,9 +61,9 @@ impl Default for Settings {
             multicore_sdr_lookahead: 800,
 
             use_mpool: false,
-            p1_tasks: 29,
-            p1_total: 1430,
-            p1_block: 1_073_741_824,
+            p1_tasks: 6,
+            p1_total: 152,
+            p1_block: 33_554_432,
         }
     }
 }

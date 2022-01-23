@@ -210,7 +210,7 @@ impl Drop for LabelPool {
 fn create_pool(pool_size: usize) -> Vec<u8> {
     info!("PPERF: alloc pool");
     unsafe {
-        let data = libc::mmap(ptr::null_mut(), pool_size, libc::PROT_READ|libc::PROT_WRITE, libc::MAP_PRIVATE, -1, 0);
+        let data = libc::mmap(ptr::null_mut(), pool_size, libc::PROT_READ|libc::PROT_WRITE, libc::MAP_PRIVATE|libc::MAP_ANONYMOUS, -1, 0);
         if data == libc::MAP_FAILED {
             panic!("PPERF: out of memory");
         }
