@@ -46,6 +46,7 @@ use crate::stacked::vanilla::{
 use std::path::Path;
 use std::collections::HashMap;
 use std::env;
+use std::fmt;
 
 //extern crate libc;
 
@@ -90,6 +91,12 @@ pub struct LabelPool {
     pub idxmap:     Vec<usize>,
     pub banks:      Vec<usize>,
     pub pool:       Vec<u8>,
+}
+
+impl fmt::Display for LabelPool {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "LabelPool(Tasks-{}, MaxIdx-{}, IdxMap-{:?})", self.tasks, self.maxidx, self.idxmap)
+    }
 }
 
 impl LabelPool {
@@ -267,6 +274,8 @@ impl LayerBlocks {
         let pool = lock.lock().unwrap();
         let count = pool.sector / pool.block;
 
+        info!("LayerBlocks id:{:?}", thread::current().id());
+
         Self {
             block_tid: thread::current().id(),
             block_nodes: pool.block / NODE_SIZE,
@@ -309,9 +318,9 @@ impl LayerBlocks {
 
             if idx >= self.blocks.len() {
                 while !pool.available(idx) {
-                    info!("wait block node: {:?}", thread::current().id());
+                    info!("node proberen: {:?}@-{:?}", self.block_tid, thread::current().id());
                     pool = cond.wait(pool).unwrap();
-                    info!("get block node: {:?}", thread::current().id());
+                    info!("node verhogen: {:?}@-{:?}", self.block_tid, thread::current().id());
                 }
 
                 if idx >= self.blocks.len() {
@@ -347,9 +356,9 @@ impl LayerBlocks {
 
             if idx >= self.blocks.len() {
                 while !pool.available(idx) {
-                    info!("wait block vec: {:?}", thread::current().id());
+                    info!("vec proberen: {:?}@-{:?}", self.block_tid, thread::current().id());
                     pool = cond.wait(pool).unwrap();
-                    info!("get block vec: {:?}", thread::current().id());
+                    info!("vec verhogen: {:?}@-{:?}", self.block_tid, thread::current().id());
                 }
 
                 if idx >= self.blocks.len() {
@@ -373,9 +382,9 @@ impl LayerBlocks {
 
             if idx >= self.blocks.len() {
                 while !pool.available(idx) {
-                    info!("wait block slice: {:?}", thread::current().id());
+                    info!("slice proberen: {:?}@-{:?}", self.block_tid, thread::current().id());
                     pool = cond.wait(pool).unwrap();
-                    info!("get block slice: {:?}", thread::current().id());
+                    info!("slice verhogen: {:?}@-{:?}", self.block_tid, thread::current().id());
                 }
 
                 if idx >= self.blocks.len() {
