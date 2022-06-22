@@ -6,7 +6,7 @@ use std::path::{Path, PathBuf};
 use anyhow::{ensure, Context, Error};
 use blstrs::Scalar as Fr;
 use ff::Field;
-use filecoin_hashers::{HashFunction, Hasher};
+use filecoin_hashers::{Domain, HashFunction, Hasher};
 use fr32::{bytes_into_fr, fr_into_bytes_slice};
 use generic_array::typenum::Unsigned;
 use log::{info, trace};
@@ -35,9 +35,9 @@ use storage_proofs_porep::stacked::{StackedDrg, TreeRElementData};
 
 use crate::{
     constants::{
-        apex_leaf_count, challenge_count, hs, partition_count, TreeD, TreeDArity, TreeDDomain,
-        TreeDHasher, TreeDStore, TreeRDomain, TreeRHasher, ALLOWED_SECTOR_SIZES,
-        POSEIDON_CONSTANTS_GEN_RANDOMNESS,
+        apex_leaf_count, challenge_count, challenge_count_poseidon, hs, partition_count, TreeD,
+        TreeDArity, TreeDDomain, TreeDHasher, TreeDStore, TreeRDomain, TreeRHasher,
+        ALLOWED_SECTOR_SIZES, POSEIDON_CONSTANTS_GEN_RANDOMNESS,
     },
     Challenges,
 };
@@ -50,7 +50,7 @@ pub struct SetupParams {
     pub sector_bytes: u64,
 }
 
-#[derive(Clone)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PublicParams {
     // The sector-size measured in nodes.
     pub sector_nodes: usize,
@@ -114,6 +114,27 @@ impl PublicParams {
             partition_bit_len,
             apex_leaf_count,
             apex_leaf_bit_len,
+        }
+    }
+
+    pub fn from_sector_size_poseidon(sector_bytes: u64) -> Self {
+        let sector_nodes = ALLOWED_SECTOR_SIZES
+            .iter()
+            .copied()
+            .find(|allowed_nodes| (allowed_nodes << 5) as u64 == sector_bytes)
+            .expect("provided sector-size is not allowed");
+
+        let challenge_bit_len = sector_nodes.trailing_zeros() as usize;
+        let challenge_count = challenge_count_poseidon(sector_nodes);
+
+        PublicParams {
+            sector_nodes,
+            challenge_count,
+            challenge_bit_len,
+            partition_count: 1,
+            partition_bit_len: 0,
+            apex_leaf_count: 0,
+            apex_leaf_bit_len: 0,
         }
     }
 }
@@ -474,7 +495,7 @@ where
 // `phi = H(comm_d_new, comm_r_old)` where Poseidon uses the custom "gen randomness" domain
 // separation tag.
 #[inline]
-pub fn phi(comm_d_new: &TreeDDomain, comm_r_old: &TreeRDomain) -> TreeRDomain {
+pub fn phi<TreeDDomain: Domain>(comm_d_new: &TreeDDomain, comm_r_old: &TreeRDomain) -> TreeRDomain {
     let comm_d_new: Fr = (*comm_d_new).into();
     let comm_r_old: Fr = (*comm_r_old).into();
     Poseidon::new_with_preimage(
@@ -541,7 +562,7 @@ where
         let tree_d_arity = TreeDArity::to_usize();
         let tree_d_nodes = tree_d_new_config.size.expect("config size failure");
         trace!(
-            "Instantiating TreeDNew: leafs={}, base_store_size={})",
+            "Instantiating TreeDNew: leafs={}, base_store_size={}",
             tree_d_leafs,
             tree_d_nodes
         );
@@ -570,6 +591,7 @@ where
             tree_r_base_tree_leafs,
             tree_r_base_tree_count,
         )?;
+
         trace!(
             "Instantiating {}: arity={}-{}-{}, base_tree_count={}, base_store_size={}",
             name,
@@ -579,6 +601,14 @@ where
             tree_r_base_tree_count,
             tree_r_base_tree_nodes,
         );
+
+        trace!("ReplicaConfig Path: {:?}", replica_config.path);
+        for config in &tree_r_configs {
+            trace!(
+                "StoreConfig: {:?}",
+                StoreConfig::data_path(&config.path, &config.id)
+            );
+        }
         create_lc_tree::<LCTree<TreeRHasher, TreeR::Arity, TreeR::SubTreeArity, TreeR::TopTreeArity>>(
             tree_r_base_tree_nodes,
             &tree_r_configs,

@@ -153,9 +153,13 @@ fn cache_empty_sector_update_params<Tree: 'static + MerkleTreeTrait<Hasher = Tre
     about = "generates and caches SDR PoRep, Winning-PoSt, Window-PoSt, and EmptySectorUpdate groth params"
 )]
 struct Opt {
-    #[structopt(long, help = "Only cache PoSt groth params.")]
+    #[structopt(long, group = "onlyonecache", help = "Only cache PoSt groth params.")]
     only_post: bool,
-    #[structopt(long, help = "Only cache EmptySectorUpdate groth params.")]
+    #[structopt(
+        long,
+        group = "onlyonecache",
+        help = "Only cache EmptySectorUpdate groth params."
+    )]
     only_sector_update: bool,
     #[structopt(
         short = "z",
@@ -305,7 +309,7 @@ pub fn main() {
         info!("{}", &message);
 
         let spinner = ProgressBar::new_spinner();
-        spinner.set_message(&message);
+        spinner.set_message(message);
         spinner.enable_steady_tick(100);
 
         if opts.only_sector_update {
@@ -319,6 +323,6 @@ pub fn main() {
             }
         }
 
-        spinner.finish_with_message(&format!("✔ {}", &message));
+        spinner.finish_with_message(format!("✔ Generated sector size: {}", human_size));
     }
 }
