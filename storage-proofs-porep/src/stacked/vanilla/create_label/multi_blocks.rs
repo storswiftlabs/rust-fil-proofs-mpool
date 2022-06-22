@@ -100,16 +100,15 @@ pub struct LabelPool {
 
 impl fmt::Debug for LabelPool {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "LabelPool(lenmap-{:?}, priority-{:?}, threshold-{:?})",
-                self.lenmap, self.priorities, self.thresholds)
-
+        write!(f, "LabelPool(idx-{:?}, len-{:?}, priority-{:?}, threshold-{:?}, banks-{})",
+                self.tidmap, self.lenmap, self.priorities, self.thresholds, self.banks.len())
     }
 }
 
 impl fmt::Display for LabelPool {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "LabelPool(lenmap-{:?}, priority-{:?}, threshold-{:?})",
-                self.lenmap, self.priorities, self.thresholds)
+        write!(f, "LabelPool(idx-{:?}, len-{:?}, priority-{:?}, threshold-{:?}, banks-{})",
+                self.tidmap, self.lenmap, self.priorities, self.thresholds, self.banks.len())
     }
 }
 
@@ -235,15 +234,17 @@ impl LabelPool {
     }
 
     pub fn available(&self, tid: &ThreadId, preindex: usize) -> bool {
-        if let Some(cnt) = self.lenmap.get(tid) {
-            if *cnt <= self.count {
-                return true;
+        if self.banks.len() > 0 {
+            if let Some(cnt) = self.lenmap.get(tid) {
+                if *cnt <= self.count {
+                    return true;
+                }
             }
-        }
 
-        if let Some(gap) = self.thresholds.get(tid) {
-            if self.count - preindex >= *gap {
-                return true;
+            if let Some(gap) = self.thresholds.get(tid) {
+                if self.count - preindex >= *gap {
+                    return true;
+                }
             }
         }
 
