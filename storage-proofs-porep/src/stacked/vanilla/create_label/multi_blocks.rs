@@ -145,15 +145,38 @@ impl LabelPool {
         // must make sure enough memory for one task at least, so skip task-0.
         // S * (1 + (N-1)) * (N - 1) / 2 = (2 * count * N - total)
         let mut rank = vec![0usize; tasks];
-        let gap = 2 * count * tasks - total;
+        let mut gap = 2 * count * tasks - total;
         if gap as i32 > 0 {
             let mut sum = 0usize;
+            let mut j = 0;
             for i in (1..tasks) {
                 let mut step = (gap - sum) * 2 / ((tasks - 1 + i) * (tasks - i));
-                rank[i] = step * i; 
-                sum += step * i;
+                step *= i;
+                // make sure delta in 0..count range
+                if step >= count - 1 {
+                    step = count - 1;
+                    // record start
+                    if 0 == j {
+                        j = i;
+                    }
+                }
+                rank[i] = step; 
+                sum += step;
             }
-            rank[tasks - 1] += gap - sum;
+
+            // align remain gaps with head nodes (1..j) = j-1 again
+            gap -= sum;
+            let cnt = j - 1;
+            for i in (1..j) {
+                let step = (gap + cnt - 1) / cnt;
+                if gap > step {
+                    rank[i] += step;
+                    gap -= step;
+                } else {
+                    rank[i] += gap;
+                    break;
+                }
+            }
         }
         info!("MPOOL: gap rank={:?}", &rank);
 
@@ -190,6 +213,7 @@ impl LabelPool {
         let idx = self.priorities.len();
         self.priorities.push(*tid);
         self.thresholds.insert(*tid, self.rank[idx]);
+        self.lenmap.insert(*tid, 0);
     }
 
     pub fn reorder(&mut self, tid: &ThreadId) {
@@ -234,19 +258,20 @@ impl LabelPool {
     }
 
     pub fn available(&self, tid: &ThreadId, preindex: usize) -> bool {
-        if self.banks.len() > 0 {
+        //if self.banks.len() > 0 {
             if let Some(cnt) = self.lenmap.get(tid) {
+                // make sure one layer done at least
                 if *cnt <= self.count {
                     return true;
                 }
             }
 
             if let Some(gap) = self.thresholds.get(tid) {
-                if self.count - preindex >= *gap {
+                if preindex + *gap < self.count {
                     return true;
                 }
             }
-        }
+        //}
 
         return false;
      }
