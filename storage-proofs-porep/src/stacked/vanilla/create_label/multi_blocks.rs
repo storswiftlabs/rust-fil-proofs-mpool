@@ -22,7 +22,7 @@ use generic_array::{
     typenum::{Unsigned, U64},
     GenericArray,
 };
-use log::{debug, info};
+use log::{debug, info, warn};
 use mapr::MmapMut;
 use merkletree::store::{DiskStore, Store, StoreConfig};
 use storage_proofs_core::{
@@ -91,19 +91,25 @@ pub struct LabelPool {
     pub idxmap:     Vec<usize>,
     pub banks:      Vec<usize>,
     pub pool:       Vec<u8>,
+
+    pub lenmap:     HashMap<ThreadId, usize>,
+    pub rank:       Vec<usize>,
+    pub priorities: Vec<ThreadId>,
+    pub thresholds: HashMap<ThreadId, usize>,
 }
 
 impl fmt::Debug for LabelPool {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "LabelPool(maxidx-{}, idxmap-{:?}, banks_len-{})",
-                self.maxidx, self.idxmap, self.banks.len())
+        write!(f, "LabelPool(lenmap-{:?}, priority-{:?}, threshold-{:?})",
+                self.lenmap, self.priorities, self.thresholds)
+
     }
 }
 
 impl fmt::Display for LabelPool {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "LabelPool(maxidx-{}, idxmap-{:?}, banks_len-{})",
-                self.maxidx, self.idxmap, self.banks.len())
+        write!(f, "LabelPool(lenmap-{:?}, priority-{:?}, threshold-{:?})",
+                self.lenmap, self.priorities, self.thresholds)
     }
 }
 
@@ -125,7 +131,7 @@ impl LabelPool {
         };
         let pool_size: usize = block * total;
 
-        info!("PPERF: tasks={} total={}, steps={}", tasks, total, count);
+        info!("MPOOL: tasks={} total={}, steps={}", tasks, total, count);
         assert!(pool_size > sector * (tasks + 1), "Pool size must great than minimum margin!!!");
 
         // medium : sector * (tasks * 3 + 1) / 2
@@ -133,6 +139,24 @@ impl LabelPool {
         // maximum: sector * (tasks * 2)
         //assert!(pool_size >= sector * (tasks + 1));
         //assert!(pool_size <= sector * tasks * 2);
+        if pool_size > sector * tasks * 2 {
+            warn!("Pool size is larger than maximum margin!!!");
+        }
+
+        // must make sure enough memory for one task at least, so skip task-0.
+        // S * (1 + (N-1)) * (N - 1) / 2 = (2 * count * N - total)
+        let mut rank = vec![0usize; tasks];
+        let gap = 2 * count * tasks - total;
+        if gap as i32 > 0 {
+            let mut sum = 0usize;
+            for i in (1..tasks) {
+                let mut step = (gap - sum) * 2 / ((tasks - 1 + i) * (tasks - i));
+                rank[i] = step; 
+                sum += step;
+            }
+            rank[tasks - 1] += gap - sum;
+        }
+        info!("MPOOL: gap rank={:?}", &rank);
 
         Self {
             sector,
@@ -149,16 +173,83 @@ impl LabelPool {
                 v
             },
             pool: create_pool(pool_size),
+            lenmap: HashMap::new(),
+            rank,
+            priorities: Vec::with_capacity(tasks),
+            thresholds: HashMap::new(),
         }
     }
 
-    pub fn available(&self, preindex: usize) -> bool {
-        // find out max index
-        let spare = self.count - self.maxidx;
+    pub fn register(&mut self, tid: &ThreadId) {
+        // base and exp layers are in the same task, register only once.
+        for elem in self.priorities.iter() {
+            if *elem == *tid {
+                return;
+            }
+        }
 
-        self.banks.len() > 0 && (self.banks.len() > spare || preindex + 1 > self.maxidx)
+        let idx = self.priorities.len();
+        self.priorities.push(*tid);
+        self.thresholds.insert(*tid, self.rank[idx]);
     }
 
+    pub fn reorder(&mut self, tid: &ThreadId) {
+        let mut index = usize::MAX;
+
+        for (i, v) in self.priorities.iter().enumerate() {
+            if *v == *tid {
+                index = i;
+                break;
+            }
+        }
+        
+        if index != usize::MAX {
+            self.priorities.remove(index);
+            self.priorities.push(*tid);
+
+            for (i, v) in self.priorities.iter().enumerate() {
+                self.thresholds.insert(*v, self.rank[i]);
+            }
+        }
+    }
+
+    pub fn unregister(&mut self, tid: &ThreadId) {
+        let mut index = usize::MAX;
+
+        for (i, v) in self.priorities.iter().enumerate() {
+            if *v == *tid {
+                index = i;
+                break;
+            }
+        }
+
+        if index != usize::MAX {
+            self.priorities.remove(index);
+            self.thresholds.remove(tid);
+            self.lenmap.remove(tid);
+
+            for (i, v) in self.priorities.iter().enumerate() {
+                self.thresholds.insert(*v, self.rank[i]);
+            }
+        }
+    }
+
+    pub fn available(&self, tid: &ThreadId, preindex: usize) -> bool {
+        if let Some(cnt) = self.lenmap.get(tid) {
+            if *cnt <= self.count {
+                return true;
+            }
+        }
+
+        if let Some(gap) = self.thresholds.get(tid) {
+            if self.count - preindex >= *gap {
+                return true;
+            }
+        }
+
+        return false;
+     }
+ 
     pub fn acquire(&mut self, tid: ThreadId, index: usize) -> Option<ManuallyDrop<Vec<u8>>> {
         assert!(index < self.total);
 
@@ -172,6 +263,9 @@ impl LabelPool {
             self.idxmap[idx] = index + 1;
             self.tidmap.insert(tid, index + 1);
 
+            let cnt = self.lenmap.get(&tid).map_or(1, |v| *v + 1);
+            self.lenmap.insert(tid, cnt);
+
             // find max index from tidmap
             let mut v = self.tidmap.values().copied().collect::<Vec<_>>();
             v.sort();
@@ -184,6 +278,17 @@ impl LabelPool {
     }
 
     pub fn release(&mut self, tid: ThreadId, buf: &mut Vec<ManuallyDrop<Vec<u8>>>) {
+        // update lenmap
+        if let Some(cnt) = self.lenmap.get(&tid) {
+            assert!(*cnt > buf.len());
+            let val = *cnt - buf.len();
+
+            if val <= self.count && self.count < *cnt {
+                self.reorder(&tid);
+            }
+            self.lenmap.insert(tid, val);
+        }
+
         for _ in 0..buf.len() {
             let v = buf.pop().unwrap();
             let ptr = v.as_ptr();
@@ -223,13 +328,13 @@ impl Drop for LabelPool {
 
 // Allocate label pool
 fn create_pool(pool_size: usize) -> Vec<u8> {
-    info!("PPERF: alloc pool");
+    info!("MPOOL: alloc pool");
     unsafe {
         let data = libc::mmap(ptr::null_mut(), pool_size, libc::PROT_READ|libc::PROT_WRITE, libc::MAP_PRIVATE|libc::MAP_ANONYMOUS, -1, 0);
         if data == libc::MAP_FAILED {
-            panic!("PPERF: out of memory");
+            panic!("MPOOL: out of memory");
         }
-        info!("PPERF: alloc buffer {:p}, len={}", data, pool_size);
+        info!("MPOOL: alloc buffer {:p}, len={}", data, pool_size);
         Vec::from_raw_parts(data as *mut u8, pool_size, pool_size)
     }
 }
@@ -237,7 +342,7 @@ fn create_pool(pool_size: usize) -> Vec<u8> {
 // Free label pool
 fn destroy_pool(buf: Vec<u8>) {
     unsafe {
-        info!("PPERF: free buffer {:p}, len={}", buf.as_ptr(), buf.len());
+        info!("MPOOL: free buffer {:p}, len={}", buf.as_ptr(), buf.len());
         libc::munmap(buf.as_ptr() as *mut libc::c_void, buf.len());
     }
     core::mem::forget(buf);
@@ -247,7 +352,7 @@ fn alloc_block(tid: ThreadId, idx: usize) -> Option<ManuallyDrop<Vec<u8>>> {
     let (lock, cond) = &**LABEL_POOL_PAIR;
     let mut pool = lock.lock().unwrap();
 
-    while !pool.available(idx) {
+    while !pool.available(&tid, idx) {
         pool = cond.wait(pool).unwrap();
     }
 
@@ -279,13 +384,15 @@ impl LayerBlocks {
         *SECTOR_SIZE.lock().unwrap() = sector;
 
         let (lock, _cond) = &**LABEL_POOL_PAIR;
-        let pool = lock.lock().unwrap();
+        let mut pool = lock.lock().unwrap();
         let count = pool.sector / pool.block;
+        let tid = thread::current().id();
 
-        info!("LayerBlocks id:{:?}", thread::current().id());
+        info!("LayerBlocks id:{:?}", &tid);
+        pool.register(&tid);
 
         Self {
-            block_tid: thread::current().id(),
+            block_tid: tid,
             block_nodes: pool.block / NODE_SIZE,
             block_words: pool.block / WORD_SIZE,
             block_bytes: pool.block,
@@ -325,7 +432,7 @@ impl LayerBlocks {
             let mut pool = lock.lock().unwrap();
 
             if idx >= self.blocks.len() {
-                while !pool.available(idx) {
+                while !pool.available(&self.block_tid, idx) {
                     info!("node proberen: {:?}-@{:?}, req-{}, pool-{:?}",
                             self.block_tid, thread::current().id(), idx, pool);
                     pool = cond.wait(pool).unwrap();
@@ -365,7 +472,7 @@ impl LayerBlocks {
             let mut pool = lock.lock().unwrap();
 
             if idx >= self.blocks.len() {
-                while !pool.available(idx) {
+                while !pool.available(&self.block_tid, idx) {
                     info!("vec proberen: {:?}-@{:?}, req-{}, pool-{:?}",
                             self.block_tid, thread::current().id(), idx, pool);
                     pool = cond.wait(pool).unwrap();
@@ -393,7 +500,7 @@ impl LayerBlocks {
             let mut pool = lock.lock().unwrap();
 
             if idx >= self.blocks.len() {
-                while !pool.available(idx) {
+                while !pool.available(&self.block_tid, idx) {
                     info!("slice proberen: {:?}-@{:?}, req-{}, pool-{:?}",
                             self.block_tid, thread::current().id(), idx, pool);
                     pool = cond.wait(pool).unwrap();
@@ -426,6 +533,11 @@ impl LayerBlocks {
 
 impl Drop for LayerBlocks {
     fn drop(&mut self) {
+        {
+            let (lock, _cond) = &**LABEL_POOL_PAIR;
+            let mut pool = lock.lock().unwrap();
+            pool.unregister(&self.block_tid);
+        }
         free_block(self.block_tid, &mut self.blocks);
     }
 }
