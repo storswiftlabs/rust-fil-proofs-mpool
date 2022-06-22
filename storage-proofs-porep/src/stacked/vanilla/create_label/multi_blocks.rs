@@ -151,8 +151,8 @@ impl LabelPool {
             let mut sum = 0usize;
             for i in (1..tasks) {
                 let mut step = (gap - sum) * 2 / ((tasks - 1 + i) * (tasks - i));
-                rank[i] = step; 
-                sum += step;
+                rank[i] = step * i; 
+                sum += step * i;
             }
             rank[tasks - 1] += gap - sum;
         }
