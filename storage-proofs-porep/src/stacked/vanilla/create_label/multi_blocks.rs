@@ -148,7 +148,7 @@ impl LabelPool {
         let mut gap = 2 * count * tasks - total;
         if gap as i32 > 0 {
             let mut sum = 0usize;
-            let mut j = 0;
+            let mut j = tasks;
             for i in (1..tasks) {
                 let mut step = (gap - sum) * 2 / ((tasks - 1 + i) * (tasks - i));
                 step *= i;
@@ -156,7 +156,7 @@ impl LabelPool {
                 if step >= count - 1 {
                     step = count - 1;
                     // record start
-                    if 0 == j {
+                    if tasks == j {
                         j = i;
                     }
                 }
@@ -167,7 +167,7 @@ impl LabelPool {
             // align remain gaps with head nodes (1..j) = j-1 again
             gap -= sum;
             let cnt = j - 1;
-            for i in (1..j) {
+            for i in (1..j).rev() {
                 let step = (gap + cnt - 1) / cnt;
                 if gap > step {
                     rank[i] += step;
