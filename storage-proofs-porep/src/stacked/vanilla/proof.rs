@@ -647,7 +647,7 @@ impl<'a, Tree: 'static + MerkleTreeTrait, G: 'static + Hasher> StackedDrg<'a, Tr
                             None
                         }
                     };
-                    let mut column_tree_builder = ColumnTreeBuilder::<ColumnArity, TreeArity>::new(
+                    let mut column_tree_builder = ColumnTreeBuilder::<Fr, ColumnArity, TreeArity>::new(
                         column_batcher,
                         tree_batcher,
                         nodes_count,
@@ -1092,7 +1092,7 @@ impl<'a, Tree: 'static + MerkleTreeTrait, G: 'static + Hasher> StackedDrg<'a, Tr
                         None
                     }
                 };
-                let mut tree_builder = TreeBuilder::<Tree::Arity>::new(
+                let mut tree_builder = TreeBuilder::<Fr, Tree::Arity>::new(
                     batcher,
                     nodes_count,
                     tree_r_last_config.rows_to_discard,
@@ -1552,7 +1552,7 @@ impl<'a, Tree: 'static + MerkleTreeTrait, G: 'static + Hasher> StackedDrg<'a, Tr
                     None
                 }
             };
-            let mut tree_builder = TreeBuilder::<Tree::Arity>::new(
+            let mut tree_builder = TreeBuilder::<Fr, Tree::Arity>::new(
                 batcher,
                 nodes_count,
                 tree_r_last_config.rows_to_discard,
