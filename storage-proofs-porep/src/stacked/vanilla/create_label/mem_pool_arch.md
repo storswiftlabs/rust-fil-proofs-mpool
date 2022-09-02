@@ -1,7 +1,9 @@
 # Multi-Sector Memory Pool Support for the Sealing Precommit Phase1
 
 <!-- START doctoc generated TOC please keep comment here to allow auto update -->
+
 <!-- DON'T EDIT THIS SECTION, INSTEAD RE-RUN doctoc TO UPDATE -->
+
 **Table of Contents**  *generated with [DocToc](https://github.com/thlorenz/doctoc)*
 
 - [Introduction](#introduction)
@@ -9,7 +11,6 @@
   - [How to design the memory pool?](#how-to-design-the-memory-pool)
 
 <!-- END doctoc generated TOC please keep comment here to allow auto update -->
-
 
 This document describes the memory pool structures in the sealing procommit phase1, and covered the block allocator and layer slice management.
 
@@ -56,12 +57,19 @@ pub struct LabelPool {
     pub block:      usize,
     pub count:      usize,
     pub total:      usize,
-    
+
     pub maxidx:     usize,
     pub tidmap:     HashMap<ThreadId, usize>,
     pub idxmap:     Vec<usize>,
     pub banks:      Vec<usize>,
     pub pool:       Vec<u8>,
 }
-
 ```
+
+### **Pipeline Optimization**
+
+It's difficault to run into good pipeline status, because it is out of order on the memory allocation and free, even worse case on some task blocked long time without any re-schedule. To keep the tasks running into the good pipeline status, we need make all the tasks allocating memory in order.
+
+![p1_mpool_pipeline](img/P1_Memory_Pool_Diagram.png)
+
+The gap between full memory and available memory will be grouped into a rank, which is enabled at layer2, and bind to to the tasks according to the launch time, That is the base of pipeline. Refer to the code base for details.
