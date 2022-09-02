@@ -73,3 +73,11 @@ It's difficault to run into good pipeline status, because it is out of order on 
 ![p1_mpool_pipeline](img/P1_Memory_Pool_Diagram.png)
 
 The gap between full memory and available memory will be grouped into a rank, which is enabled at layer2, and bind to to the tasks according to the launch time, That is the base of pipeline. Refer to the code base for details.
+
+
+
+The best benifit from mpool feature is memory optimization, which is good for memory cost down.  e.g. we run 18 tasks with 32G sector on a server,  we need 18 * 64 + 56 = 1208G to cover the memory consumption based on full cache parent_cache. Under mpool feature case, 18 * 56 + 56 = 1064G memory is enough for P1 tasks w/o any performance hurt, maybe 18 * 52 + 56 = 992G is also okay with a little performance loss. You can check the  result from test report.
+
+
+
+The fantastic thing is that we can use the memory flexible during the precommit phase1, which  does not need fixed on task number.
