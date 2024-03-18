@@ -7,28 +7,24 @@ use ff::Field;
 use filecoin_hashers::{poseidon::PoseidonHasher, sha256::Sha256Hasher, Hasher};
 use fr32::fr_into_bytes;
 use generic_array::typenum::{U0, U2, U4, U8};
-use merkletree::store::StoreConfig;
 use rand::{Rng, SeedableRng};
 use rand_xorshift::XorShiftRng;
 use storage_proofs_core::{
     api_version::ApiVersion,
-    cache_key::CacheKey,
     compound_proof::CompoundProof,
     drgraph::BASE_DEGREE,
     merkle::{get_base_tree_count, DiskTree, MerkleTreeTrait},
     proof::ProofScheme,
     test_helper::setup_replica,
-    util::default_rows_to_discard,
     TEST_SEED,
 };
-use storage_proofs_porep::{
-    stacked::{
-        LayerChallenges, PrivateInputs, PublicInputs, SetupParams, StackedCompound, StackedDrg,
-        TemporaryAux, TemporaryAuxCache, BINARY_ARITY, EXP_DEGREE,
-    },
-    PoRep,
+use storage_proofs_porep::stacked::{
+    self, Challenges, PrivateInputs, PublicInputs, SetupParams, StackedCompound, StackedDrg,
+    TemporaryAuxCache, EXP_DEGREE,
 };
 use tempfile::tempdir;
+
+mod common;
 
 #[test]
 fn test_stacked_porep_circuit_poseidon_base_2() {
@@ -58,7 +54,7 @@ fn test_stacked_porep_circuit<Tree: MerkleTreeTrait + 'static>(
     let degree = BASE_DEGREE;
     let expansion_degree = EXP_DEGREE;
     let num_layers = 2;
-    let layer_challenges = LayerChallenges::new(num_layers, 1);
+    let challenges = Challenges::new_interactive(1);
 
     let mut rng = XorShiftRng::from_seed(TEST_SEED);
 
@@ -70,11 +66,6 @@ fn test_stacked_porep_circuit<Tree: MerkleTreeTrait + 'static>(
     // MT for original data is always named tree-d, and it will be
     // referenced later in the process as such.
     let cache_dir = tempdir().unwrap();
-    let config = StoreConfig::new(
-        cache_dir.path(),
-        CacheKey::CommDTree.to_string(),
-        default_rows_to_discard(nodes, BINARY_ARITY),
-    );
 
     // Generate a replica path.
     let replica_path = cache_dir.path().join("replica-path");
@@ -86,20 +77,20 @@ fn test_stacked_porep_circuit<Tree: MerkleTreeTrait + 'static>(
         degree,
         expansion_degree,
         porep_id: arbitrary_porep_id,
-        layer_challenges,
+        challenges,
+        num_layers,
         api_version: ApiVersion::V1_1_0,
+        api_features: vec![],
     };
 
     let pp = StackedDrg::<Tree, Sha256Hasher>::setup(&sp).expect("setup failed");
-    let (tau, (p_aux, t_aux)) = StackedDrg::<Tree, Sha256Hasher>::replicate(
+    let (tau, (p_aux, t_aux)) = common::transform_and_replicate_layers::<Tree, Sha256Hasher>(
         &pp,
         &replica_id.into(),
         (mmapped_data.as_mut()).into(),
-        None,
-        config,
+        cache_dir.path().to_path_buf(),
         replica_path.clone(),
-    )
-    .expect("replication failed");
+    );
 
     let mut copied = vec![0; data.len()];
     copied.copy_from_slice(&mmapped_data);
@@ -109,17 +100,14 @@ fn test_stacked_porep_circuit<Tree: MerkleTreeTrait + 'static>(
     let pub_inputs =
         PublicInputs::<<Tree::Hasher as Hasher>::Domain, <Sha256Hasher as Hasher>::Domain> {
             replica_id: replica_id.into(),
-            seed,
+            seed: Some(seed),
             tau: Some(tau),
             k: None,
         };
 
-    // Store copy of original t_aux for later resource deletion.
-    let t_aux_orig = t_aux.clone();
-
     // Convert TemporaryAux to TemporaryAuxCache, which instantiates all
     // elements based on the configs stored in TemporaryAux.
-    let t_aux = TemporaryAuxCache::<Tree, Sha256Hasher>::new(&t_aux, replica_path)
+    let t_aux = TemporaryAuxCache::<Tree, Sha256Hasher>::new(&t_aux, replica_path, false)
         .expect("failed to restore contents of t_aux");
 
     let priv_inputs = PrivateInputs::<Tree, Sha256Hasher> { p_aux, t_aux };
@@ -135,7 +123,7 @@ fn test_stacked_porep_circuit<Tree: MerkleTreeTrait + 'static>(
     assert!(proofs_are_valid);
 
     // Discard cached MTs that are no longer needed.
-    TemporaryAux::<Tree, Sha256Hasher>::clear_temp(t_aux_orig).expect("t_aux delete failed");
+    stacked::clear_cache_dir(cache_dir.path()).expect("cached files delete failed");
 
     {
         // Verify that MetricCS returns the same metrics as TestConstraintSystem.
@@ -168,7 +156,7 @@ fn test_stacked_porep_circuit<Tree: MerkleTreeTrait + 'static>(
         "wrong number of constraints"
     );
 
-    assert_eq!(cs.get_input(0, "ONE"), Fr::one());
+    assert_eq!(cs.get_input(0, "ONE"), Fr::ONE);
 
     let generated_inputs = <StackedCompound<Tree, Sha256Hasher> as CompoundProof<
         StackedDrg<'_, Tree, Sha256Hasher>,

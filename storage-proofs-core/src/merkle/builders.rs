@@ -19,9 +19,13 @@ use rayon::prelude::{IntoParallelIterator, ParallelIterator};
 
 use crate::{
     error::{Error, Result},
-    merkle::{DiskTree, LCMerkleTree, LCStore, LCTree, MerkleTreeTrait, MerkleTreeWrapper},
+    merkle::{DiskTree, LCTree, MerkleTreeTrait, MerkleTreeWrapper},
     util::{data_at_node, default_rows_to_discard, NODE_SIZE},
 };
+
+/// A tree where the specified arity is used for all the levels. Some levels are not persisted to
+/// disk, but only cached in memory.
+type LCMerkleTree<H, U> = LCTree<H, U, U0, U0>;
 
 // Create a DiskTree from the provided config(s), each representing a 'base' layer tree with 'base_tree_len' elements.
 pub fn create_disk_tree<Tree: MerkleTreeTrait>(
@@ -76,7 +80,7 @@ pub fn create_lc_tree<Tree: MerkleTreeTrait>(
         LCTree::from_store_configs_and_replica(base_tree_leafs, configs, replica_config)
     } else {
         ensure!(configs.len() == 1, "Invalid tree-shape specified");
-        let store = LCStore::new_from_disk_with_reader(
+        let store = LevelCacheStore::new_from_disk_with_reader(
             base_tree_len,
             Tree::Arity::to_usize(),
             &configs[0],
@@ -180,7 +184,7 @@ pub fn create_base_merkle_tree<Tree: MerkleTreeTrait>(
     data: &[u8],
 ) -> Result<Tree> {
     ensure!(
-        data.len() == (NODE_SIZE * size) as usize,
+        data.len() == (NODE_SIZE * size),
         Error::InvalidMerkleTreeArgs(data.len(), NODE_SIZE, size)
     );
 
@@ -280,46 +284,16 @@ pub fn split_config(config: StoreConfig, count: usize) -> Result<Vec<StoreConfig
         return Ok(vec![config]);
     }
 
-    let mut configs = Vec::with_capacity(count);
-    for i in 0..count {
-        configs.push(StoreConfig::from_config(
-            &config,
-            format!("{}-{}", config.id, i),
-            None,
-        ));
-        configs[i].rows_to_discard = config.rows_to_discard;
-    }
+    let configs = (0..count)
+        .map(|i| StoreConfig {
+            path: config.path.clone(),
+            id: format!("{}-{}", config.id, i),
+            size: config.size,
+            rows_to_discard: config.rows_to_discard,
+        })
+        .collect();
 
     Ok(configs)
-}
-
-// Given a StoreConfig, generate additional ones with appended numbers
-// to uniquely identify them and return the results.  If count is 1,
-// the original config is not modified.
-//
-// Useful for testing, where there the config may be None.
-pub fn split_config_wrapped(
-    config: Option<StoreConfig>,
-    count: usize,
-) -> Result<Vec<Option<StoreConfig>>> {
-    if count == 1 {
-        return Ok(vec![config]);
-    }
-
-    match config {
-        Some(c) => {
-            let mut configs = Vec::with_capacity(count);
-            for i in 0..count {
-                configs.push(Some(StoreConfig::from_config(
-                    &c,
-                    format!("{}-{}", c.id, i),
-                    None,
-                )));
-            }
-            Ok(configs)
-        }
-        None => Ok(vec![None]),
-    }
 }
 
 // Given a StoreConfig, replica path and tree_width (leaf nodes),
@@ -344,19 +318,19 @@ pub fn split_config_and_replica(
         ));
     }
 
-    let mut configs = Vec::with_capacity(count);
-    let mut replica_offsets = Vec::with_capacity(count);
-
-    for i in 0..count {
-        configs.push(StoreConfig::from_config(
-            &config,
-            format!("{}-{}", config.id, i),
-            None,
-        ));
-        configs[i].rows_to_discard = config.rows_to_discard;
-
-        replica_offsets.push(i * sub_tree_width * NODE_SIZE);
-    }
+    let (configs, replica_offsets) = (0..count)
+        .map(|i| {
+            (
+                StoreConfig {
+                    path: config.path.clone(),
+                    id: format!("{}-{}", config.id, i),
+                    size: config.size,
+                    rows_to_discard: config.rows_to_discard,
+                },
+                i * sub_tree_width * NODE_SIZE,
+            )
+        })
+        .unzip();
 
     Ok((
         configs,
@@ -414,7 +388,7 @@ where
         let id: u64 = rng.gen();
         let replica_path = temp_path.join(format!("replica-path-{}", id));
         let config = StoreConfig::new(
-            &temp_path,
+            temp_path,
             format!("test-lc-tree-{}", id),
             default_rows_to_discard(nodes, Tree::Arity::to_usize()),
         );

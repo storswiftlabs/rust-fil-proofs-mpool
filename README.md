@@ -4,13 +4,10 @@ The **Filecoin Proving Subsystem** (or FPS) provides the storage proofs required
 
 There are currently several different crates:
 
-- [**Storage Proofs (`storage-proofs`)**](./storage-proofs)
-    A library for constructing storage proofs – including non-circuit proofs, corresponding SNARK circuits, and a method of combining them.
-
-- [**Storage Proofs Core (`storage-proofs-core`)**](./storage-proofs/core)
+- [**Storage Proofs Core (`storage-proofs-core`)**](./storage-proofs-core)
     A set of common primitives used throughout the other storage-proofs sub-crates, including crypto, merkle tree, hashing and gadget interfaces.
 
-- [**Storage Proofs PoRep (`storage-proofs-porep`)**](./storage-proofs/porep)
+- [**Storage Proofs PoRep (`storage-proofs-porep`)**](./storage-proofs-porep)
     `storage-proofs-porep` is intended to serve as a reference implementation for _**Proof-of-Replication**_ (**PoRep**), while also performing the heavy lifting for `filecoin-proofs`.
 
     Primary Components:
@@ -18,7 +15,7 @@ There are currently several different crates:
      -   **DrgPoRep** (_Depth Robust Graph_ **_Proof-of-Replication_**)
      -   **StackedDrgPoRep**
 
-- [**Storage Proofs PoSt (`storage-proofs-post`)**](./storage-proofs/post)
+- [**Storage Proofs PoSt (`storage-proofs-post`)**](./storage-proofs-post)
     `storage-proofs-post` is intended to serve as a reference implementation for _**Proof-of-Space-time**_ (**PoSt**), for `filecoin-proofs`.
 
     Primary Components:
@@ -26,11 +23,33 @@ There are currently several different crates:
 
 
 - [**Filecoin Proofs (`filecoin-proofs`)**](./filecoin-proofs)
-  A wrapper around `storage-proofs`, providing an FFI-exported API callable from C (and in practice called by [lotus](https://github.com/filecoin-project/lotus) via cgo). Filecoin-specific values of setup parameters are included here.
+    Filecoin-specific values of setup parameters are included here. The API is wrapped in [`rust-filecoin-proofs-api`](https://github.com/filecoin-project/rust-filecoin-proofs-api), which then is the basis for the FFI-exported API in [`filecoin-ffi`](https://github.com/filecoin-project/filecoin-ffi) callable from C (and in practice called by [lotus](https://github.com/filecoin-project/lotus) via cgo).
+
+The dependencies between those crates look like this:
+
+```
+       ┌────────────────────────────────────────────────────────────────────┐
+       │                             filecoin-proofs                        │
+       └─────┬────────────────────────────┬──────────────┬─────────────┬────┘
+             │                            │              │             │
+             │                            │              │             │
+             │                            │              │             │
+┌────────────▼──────────┐     ┌───────────▼──────────┐   │   ┌─────────▼───────────┐
+│ storage-proofs-update ├─────▶ storage-proofs-porep │   │   │ storage-proofs-post │
+└────────────┬──────────┘     └───────────┬──────────┘   │   └─────────┬───────────┘
+             │                            │              │             │
+             │                            │              │             │
+             │                            │              │             │
+       ┌─────▼────────────────────────────▼──────────────▼─────────────▼────┐
+       │                           storage-proofs-core                      │
+       └────────────────────────────────────────────────────────────────────┘
+```
+
+Things shared between crates, should go into `storage-proofs-core`. An exception is the `storage-proofs-update`, which needs the needs the stacked DRG from `storage-proofs-porep`. All crates are free to use other crates for the workspace like [`filecoin-hashers`](./filecoin-hashers) or [`fr32`](./fr32).
 
 ## Security Audits
 
-The `rust-fil-proofs` proofs code and the [Filecoin Spec](https://bafybeidxw5vxjdwsun2zc2illagf43v6w5r5w63vg455h7vjesbyqssg64.ipfs.dweb.link/algorithms/sdr/) has undergone a [proofs security audit](audits/Sigma-Prime-Protocol-Labs-Filecoin-Proofs-Security-Review-v2.1.pdf) performed by [Sigma Prime](https://sigmaprime.io/) and been deemed free of *critical* or *major* security issues.  In addition to the security review, the document provides the summary of findings, vulnerability classifications, and recommended resolutions.  All known issues have been resolved to date in both the code and the specification.
+The `rust-fil-proofs` proofs code and the [Filecoin Spec](https://spec.filecoin.io/algorithms/sdr/) has undergone a [proofs security audit](audits/Sigma-Prime-Protocol-Labs-Filecoin-Proofs-Security-Review-v2.1.pdf) performed by [Sigma Prime](https://sigmaprime.io/) and been deemed free of *critical* or *major* security issues.  In addition to the security review, the document provides the summary of findings, vulnerability classifications, and recommended resolutions.  All known issues have been resolved to date in both the code and the specification.
 
 `rust-fil-proofs` has also undergone a [SNARK proofs security audit performed by Dr. Jean-Philippe Aumasson and Antony Vennard](audits/protocolai-audit-20200728.pdf) and been deemed free of *critical* or *major* security issues.  In addition to the security analysis, the document provides the audit goals, methodology, functionality descriptions and finally observations on what could be improved.  All known issues have been resolved to date.
 
@@ -112,6 +131,8 @@ The main benchmarking tool is called `benchy`.  `benchy` has several subcommands
 > cargo run --release --bin benchy -- window-post --size 2KiB
 > cargo run --release --bin benchy -- window-post-fake --size 2KiB --fake
 > cargo run --release --bin benchy -- prodbench
+# After a preserved cache is generated, this command tests *only* synthetic proof generation
+> cargo run --release --bin benchy -- porep --size 2KiB --synthetic --cache /d1/nemo/tmp/cache-2k --skip-precommit-phase1 --skip-precommit-phase2 --skip-commit-phase1 --skip-commit-phase2
 ```
 
 ### Window PoSt Bench usages
@@ -321,7 +342,7 @@ FIL_PROOFS_GPU_FRAMEWORK=cuda
 
 You can set it to `opencl` to use OpenCL instead.  The default value is `cuda`, when you set nothing or any other (invalid) value.
 
-CUDA kernels are compiled and build time.  By default, they are built for recent architectures, Turing (`sm_75` and Ampere (`sm_80`, `sm_86`).  This increases the overall build time by several minutes.  You can reduce it by compiling it only for the specific aritecture you need.  For example if you only need the CUDA kernels to work on the Turing architecture, you can set on all dependencies that use CUDA kernels:
+CUDA kernels are compiled and build time.  By default, they are built for recent architectures, Turing (`sm_75` and Ampere (`sm_80`, `sm_86`).  This increases the overall build time by several minutes.  You can reduce it by compiling it only for the specific architecture you need.  For example if you only need the CUDA kernels to work on the Turing architecture, you can set on all dependencies that use CUDA kernels:
 
 ```
 BELLMAN_CUDA_NVCC_ARGS="--fatbin --gpu-architecture=sm_75 --generate-code=arch=compute_75,code=sm_75"

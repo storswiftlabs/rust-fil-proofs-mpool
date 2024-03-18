@@ -1,6 +1,8 @@
+use std::collections::HashMap;
 use std::fs::{metadata, OpenOptions};
 use std::iter::FromIterator;
 use std::marker::PhantomData;
+use std::ops::RangeInclusive;
 use std::path::{Path, PathBuf};
 
 use anyhow::{ensure, Context, Error};
@@ -10,7 +12,7 @@ use filecoin_hashers::{Domain, HashFunction, Hasher};
 use fr32::{bytes_into_fr, fr_into_bytes_slice};
 use generic_array::typenum::Unsigned;
 use log::{info, trace};
-use memmap::{Mmap, MmapMut, MmapOptions};
+use memmap2::{Mmap, MmapMut, MmapOptions};
 use merkletree::{
     merkle::{get_merkle_tree_leafs, get_merkle_tree_len},
     store::{DiskStore, Store, StoreConfig},
@@ -30,6 +32,7 @@ use storage_proofs_core::{
     },
     parameter_cache::ParameterSetMetadata,
     proof::ProofScheme,
+    settings::SETTINGS,
 };
 use storage_proofs_porep::stacked::{StackedDrg, TreeRElementData};
 
@@ -43,7 +46,7 @@ use crate::{
 };
 
 const CHUNK_SIZE_MIN: usize = 4096;
-const FR_SIZE: usize = std::mem::size_of::<Fr>() as usize;
+const FR_SIZE: usize = std::mem::size_of::<Fr>();
 
 #[derive(Clone)]
 pub struct SetupParams {
@@ -250,6 +253,134 @@ where
             challenge_proofs: self.challenge_proofs.clone(),
         }
     }
+}
+
+// Computes all `2^h` rho values for the given `phi` in the given range. Each rho corresponds to
+// a `high` value, where `high` is the `h` high bits of a node-index.
+#[derive(Debug)]
+pub struct Rhos {
+    rhos: HashMap<usize, Fr>,
+    /// The amount of right shift that is needed to get the `h` high bits of a node.
+    bits_shr: usize,
+}
+
+impl Rhos {
+    /// Generate the `rho`s for a certain number of nodes.
+    ///
+    /// Those are used for encoding. The `nodes_count` is the total number of nodes of the sector.
+    pub fn new(phi: &TreeRDomain, h: usize, nodes_count: usize) -> Self {
+        Self::new_range(phi, h, nodes_count, 0, nodes_count)
+    }
+
+    /// Generate the inverted `rho`s for a certain number of nodes.
+    ///
+    /// Those are used for decoding. The `nodes_count` is the total number of nodes of the sector.
+    pub fn new_inv(phi: &TreeRDomain, h: usize, nodes_count: usize) -> Self {
+        Self::new_inv_range(phi, h, nodes_count, 0, nodes_count)
+    }
+
+    /// Generate the `rho`s for a certain number of nodes and range.
+    ///
+    /// Those are used for encoding.
+    ///
+    /// All inputs are in number of nodes. The `nodes_count` is the total number of nodes of the
+    /// sector. `offset` defines where the range should start, with a `num` sized length.
+    pub fn new_range(
+        phi: &TreeRDomain,
+        h: usize,
+        nodes_count: usize,
+        offset: usize,
+        num: usize,
+    ) -> Self {
+        let bits_shr = Self::calc_bits_shr(h, nodes_count);
+        let high_range = Self::calc_high_range(offset, num, bits_shr);
+
+        let rhos = high_range
+            .map(|high| (high, rho(phi, high as u32)))
+            .collect();
+        Self { rhos, bits_shr }
+    }
+
+    /// Generate the inverted `rho`s for a certain number of nodes and range.
+    ///
+    /// Those are used for decoding.
+    ///
+    /// All inputs are in number of nodes. The `nodes_count` is the total number of nodes of the
+    /// sector. `offset` defines where the range should start, with a `num` sized length.
+    pub fn new_inv_range(
+        phi: &TreeRDomain,
+        h: usize,
+        nodes_count: usize,
+        offset: usize,
+        num: usize,
+    ) -> Self {
+        let bits_shr = Self::calc_bits_shr(h, nodes_count);
+        let high_range = Self::calc_high_range(offset, num, bits_shr);
+
+        let rhos = high_range
+            .map(|high| {
+                (
+                    high,
+                    rho(phi, high as u32)
+                        .invert()
+                        .expect("rho inversion should not fail"),
+                )
+            })
+            .collect();
+        Self { rhos, bits_shr }
+    }
+
+    /// Get the rho for a specific node offset.
+    pub fn get(&self, offset: usize) -> Fr {
+        let high = offset >> self.bits_shr;
+        self.rhos[&high]
+    }
+
+    fn calc_bits_shr(h: usize, nodes_count: usize) -> usize {
+        // Right-shift each node-index by `bits_shr` to get its `h` high bits.
+        let node_index_bit_len = nodes_count.trailing_zeros() as usize;
+        node_index_bit_len - h
+    }
+
+    fn calc_high_range(offset: usize, num: usize, bits_shr: usize) -> RangeInclusive<usize> {
+        let first_high = offset >> bits_shr;
+        let last_high = (offset + num - 1) >> bits_shr;
+        first_high..=last_high
+    }
+}
+
+#[cfg(any(feature = "cuda", feature = "opencl"))]
+pub fn prepare_tree_r_data<Tree: 'static + MerkleTreeTrait>(
+    source: &DiskStore<<Tree::Hasher as Hasher>::Domain>,
+    _data: Option<&mut Data<'_>>,
+    start: usize,
+    end: usize,
+) -> Result<TreeRElementData<Tree>> {
+    let tree_data = source
+        .read_range(start..end)
+        .expect("failed to read from source");
+
+    if SETTINGS.use_gpu_tree_builder::<Tree>() {
+        Ok(TreeRElementData::FrList(
+            tree_data.into_par_iter().map(|x| x.into()).collect(),
+        ))
+    } else {
+        Ok(TreeRElementData::ElementList(tree_data))
+    }
+}
+
+#[cfg(not(any(feature = "cuda", feature = "opencl")))]
+pub fn prepare_tree_r_data<Tree: 'static + MerkleTreeTrait>(
+    source: &DiskStore<<Tree::Hasher as Hasher>::Domain>,
+    _data: Option<&mut Data<'_>>,
+    start: usize,
+    end: usize,
+) -> Result<TreeRElementData<Tree>> {
+    let tree_data = source
+        .read_range(start..end)
+        .expect("failed to read from source");
+
+    Ok(TreeRElementData::ElementList(tree_data))
 }
 
 #[derive(Debug)]
@@ -515,13 +646,6 @@ pub fn rho(phi: &TreeRDomain, high: u32) -> Fr {
     Poseidon::new_with_preimage(&[phi, high], &POSEIDON_CONSTANTS_GEN_RANDOMNESS).hash()
 }
 
-// Computes all `2^h` rho values for the given `phi`. Each rho corresponds to one of the `2^h`
-// possible `high` values where `high` is the `h` high bits of a node-index.
-#[inline]
-pub fn rhos(h: usize, phi: &TreeRDomain) -> Vec<Fr> {
-    (0..1 << h).map(|high| rho(phi, high)).collect()
-}
-
 fn mmap_read(path: &Path) -> Result<Mmap, Error> {
     let f_data = OpenOptions::new()
         .read(true)
@@ -745,42 +869,6 @@ where
         })
     }
 
-    #[cfg(any(feature = "cuda", feature = "opencl"))]
-    #[allow(clippy::unnecessary_wraps)]
-    fn prepare_tree_r_data(
-        source: &DiskStore<TreeRDomain>,
-        _data: Option<&mut Data<'_>>,
-        start: usize,
-        end: usize,
-    ) -> Result<TreeRElementData<TreeR>> {
-        let tree_data: Vec<TreeRDomain> = source
-            .read_range(start..end)
-            .expect("failed to read from source");
-
-        if StackedDrg::<TreeR, TreeDHasher>::use_gpu_tree_builder() {
-            Ok(TreeRElementData::FrList(
-                tree_data.into_par_iter().map(|x| x.into()).collect(),
-            ))
-        } else {
-            Ok(TreeRElementData::ElementList(tree_data))
-        }
-    }
-
-    #[cfg(not(any(feature = "cuda", feature = "opencl")))]
-    #[allow(clippy::unnecessary_wraps)]
-    fn prepare_tree_r_data(
-        source: &DiskStore<TreeRDomain>,
-        _data: Option<&mut Data<'_>>,
-        start: usize,
-        end: usize,
-    ) -> Result<TreeRElementData<TreeR>> {
-        let tree_data: Vec<TreeRDomain> = source
-            .read_range(start..end)
-            .expect("failed to read from source");
-
-        Ok(TreeRElementData::ElementList(tree_data))
-    }
-
     /// Returns tuple of (comm_r_new, comm_r_last_new, comm_d_new)
     pub fn encode_into(
         nodes_count: usize,
@@ -789,22 +877,10 @@ where
         comm_c: TreeRDomain,
         comm_r_last_old: TreeRDomain,
         new_replica_path: &Path,
-        new_cache_path: &Path,
         sector_key_path: &Path,
-        sector_key_cache_path: &Path,
         staged_data_path: &Path,
         h: usize,
     ) -> Result<(TreeRDomain, TreeRDomain, TreeDDomain)> {
-        // Sanity check all input path types.
-        ensure!(
-            metadata(new_cache_path)?.is_dir(),
-            "new_cache_path must be a directory"
-        );
-        ensure!(
-            metadata(sector_key_cache_path)?.is_dir(),
-            "sector_key_cache_path must be a directory"
-        );
-
         let tree_count = get_base_tree_count::<TreeR>();
         let base_tree_nodes_count = nodes_count / tree_count;
 
@@ -872,7 +948,7 @@ where
         let comm_r_old = <TreeRHasher as Hasher>::Function::hash2(&comm_c, &comm_r_last_old);
         let phi = phi(&comm_d_new, &comm_r_old);
 
-        let end = staged_data_path_metadata.len() as u64;
+        let end = staged_data_path_metadata.len();
 
         // chunk_size is the number of Fr elements to process in parallel chunks.
         let chunk_size: usize = std::cmp::min(base_tree_nodes_count, CHUNK_SIZE_MIN);
@@ -881,12 +957,8 @@ where
         // in Fr elements (i.e. chunk_size * sizeof(Fr)).
         let data_block_size: usize = chunk_size * FR_SIZE;
 
-        // Right-shift each node-index by `get_high_bits_shr` to get its `h` high bits.
-        let node_index_bit_len = nodes_count.trailing_zeros() as usize;
-        let get_high_bits_shr = node_index_bit_len - h;
-
         // Precompute all rho values.
-        let rhos = rhos(h, &phi);
+        let rhos = Rhos::new(&phi, h, nodes_count);
 
         Vec::from_iter((0..end).step_by(data_block_size))
             .into_par_iter()
@@ -898,8 +970,7 @@ where
 
                     // Get the `h` high bits from the node-index.
                     let node_index = input_index / FR_SIZE;
-                    let high = node_index >> get_high_bits_shr;
-                    let rho = rhos[high];
+                    let rho = rhos.get(node_index);
 
                     let sector_key_fr =
                         bytes_into_fr(&sector_key_data[input_index..input_index + FR_SIZE])?;
@@ -924,14 +995,14 @@ where
         // This argument is currently unused by this invocation, but required for the API.
         let mut unused_data = Data::empty();
 
-        let tree_r_last = StackedDrg::<TreeR, TreeDHasher>::generate_tree_r_last::<TreeR::Arity>(
+        let tree_r_last = StackedDrg::<TreeR, TreeDHasher>::generate_tree_r_last(
             &mut unused_data,
             base_tree_nodes_count,
             tree_count,
             tree_r_last_new_config,
             new_replica_path.to_path_buf(),
             &new_replica_store,
-            Some(Self::prepare_tree_r_data),
+            Some(prepare_tree_r_data),
         )?;
 
         let comm_r_last_new = tree_r_last.root();
@@ -1009,7 +1080,7 @@ where
         let comm_r_old = <TreeRHasher as Hasher>::Function::hash2(&comm_c, &comm_sector_key);
         let phi = phi(&comm_d_new, &comm_r_old);
 
-        let end = replica_path_metadata.len() as u64;
+        let end = replica_path_metadata.len();
 
         // chunk_size is the number of Fr elements to process in parallel chunks.
         let chunk_size: usize = std::cmp::min(base_tree_nodes_count, CHUNK_SIZE_MIN);
@@ -1018,15 +1089,8 @@ where
         // in Fr elements (i.e. chunk_size * sizeof(Fr)).
         let data_block_size: usize = chunk_size * FR_SIZE;
 
-        // Right-shift each node-index by `get_high_bits_shr` to get its `h` high bits.
-        let node_index_bit_len = nodes_count.trailing_zeros() as usize;
-        let get_high_bits_shr = node_index_bit_len - h;
-
         // Precompute all rho^-1 values.
-        let rho_invs: Vec<Fr> = rhos(h, &phi)
-            .into_iter()
-            .map(|rho| rho.invert().unwrap())
-            .collect();
+        let rho_invs = Rhos::new_inv(&phi, h, nodes_count);
 
         Vec::from_iter((0..end).step_by(data_block_size))
             .into_par_iter()
@@ -1038,8 +1102,7 @@ where
 
                     // Get the `h` high bits from the node-index.
                     let node_index = input_index / FR_SIZE;
-                    let high = node_index >> get_high_bits_shr;
-                    let rho_inv = rho_invs[high];
+                    let rho_inv = rho_invs.get(node_index);
 
                     let sector_key_fr =
                         bytes_into_fr(&sector_key_data[input_index..input_index + FR_SIZE])?;
@@ -1136,7 +1199,7 @@ where
         let comm_r_old = <TreeRHasher as Hasher>::Function::hash2(&comm_c, &comm_sector_key);
         let phi = phi(&comm_d_new, &comm_r_old);
 
-        let end = replica_path_metadata.len() as u64;
+        let end = replica_path_metadata.len();
 
         // chunk_size is the number of Fr elements to process in parallel chunks.
         let chunk_size: usize = std::cmp::min(base_tree_nodes_count, CHUNK_SIZE_MIN);
@@ -1145,12 +1208,8 @@ where
         // in Fr elements (i.e. chunk_size * sizeof(Fr)).
         let data_block_size: usize = chunk_size * FR_SIZE;
 
-        // Right-shift each node-index by `get_high_bits_shr` to get its `h` high bits.
-        let node_index_bit_len = nodes_count.trailing_zeros() as usize;
-        let get_high_bits_shr = node_index_bit_len - h;
-
         // Precompute all rho values.
-        let rhos = rhos(h, &phi);
+        let rhos = Rhos::new(&phi, h, nodes_count);
 
         Vec::from_iter((0..end).step_by(data_block_size))
             .into_par_iter()
@@ -1162,8 +1221,7 @@ where
 
                     // Get the `h` high bits from the node-index.
                     let node_index = input_index / FR_SIZE;
-                    let high = node_index >> get_high_bits_shr;
-                    let rho = rhos[high];
+                    let rho = rhos.get(node_index);
 
                     let data_fr = bytes_into_fr(&data[input_index..input_index + FR_SIZE])?;
                     let replica_data_fr =
@@ -1187,14 +1245,14 @@ where
         // This argument is currently unused by this invocation, but required for the API.
         let mut unused_data = Data::empty();
 
-        let tree_r_last = StackedDrg::<TreeR, TreeDHasher>::generate_tree_r_last::<TreeR::Arity>(
+        let tree_r_last = StackedDrg::<TreeR, TreeDHasher>::generate_tree_r_last(
             &mut unused_data,
             base_tree_nodes_count,
             tree_count,
             tree_r_last_new_config,
             sector_key_cache_path.to_path_buf(),
             &sector_key_store,
-            Some(Self::prepare_tree_r_data),
+            Some(prepare_tree_r_data),
         )?;
 
         Ok(tree_r_last.root())

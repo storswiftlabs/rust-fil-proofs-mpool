@@ -5,11 +5,11 @@ use std::str::FromStr;
 use dialoguer::{theme::ColorfulTheme, MultiSelect};
 use filecoin_proofs::{
     constants::{
-        DefaultPieceHasher, POREP_PARTITIONS, PUBLISHED_SECTOR_SIZES, WINDOW_POST_CHALLENGE_COUNT,
+        DefaultPieceHasher, SUPPORTED_SECTOR_SIZES, WINDOW_POST_CHALLENGE_COUNT,
         WINDOW_POST_SECTOR_COUNT, WINNING_POST_CHALLENGE_COUNT, WINNING_POST_SECTOR_COUNT,
     },
     parameters::{public_params, window_post_public_params, winning_post_public_params},
-    types::{PaddedBytesAmount, PoRepConfig, PoRepProofPartitions, PoStConfig, SectorSize},
+    types::{PoRepConfig, PoStConfig, SectorSize},
     with_shape, PoStType,
 };
 use humansize::{file_size_opts, FileSize};
@@ -32,13 +32,8 @@ use structopt::StructOpt;
 fn cache_porep_params<Tree: 'static + MerkleTreeTrait>(porep_config: PoRepConfig) {
     info!("generating PoRep groth params");
 
-    let public_params = public_params(
-        PaddedBytesAmount::from(porep_config),
-        usize::from(PoRepProofPartitions::from(porep_config)),
-        porep_config.porep_id,
-        porep_config.api_version,
-    )
-    .expect("failed to get public params from config");
+    let public_params =
+        public_params(&porep_config).expect("failed to get public params from config");
 
     let circuit = <StackedCompound<Tree, DefaultPieceHasher> as CompoundProof<
         StackedDrg<Tree, DefaultPieceHasher>,
@@ -213,18 +208,7 @@ fn generate_params_porep(sector_size: u64, api_version: ApiVersion) {
     with_shape!(
         sector_size,
         cache_porep_params,
-        PoRepConfig {
-            sector_size: SectorSize(sector_size),
-            partitions: PoRepProofPartitions(
-                *POREP_PARTITIONS
-                    .read()
-                    .expect("POREP_PARTITIONS poisoned")
-                    .get(&sector_size)
-                    .expect("unknown sector size"),
-            ),
-            porep_id: [0; 32],
-            api_version,
-        }
+        PoRepConfig::new_groth16(sector_size, [0; 32], api_version)
     );
 }
 
@@ -232,18 +216,7 @@ fn generate_params_empty_sector_update(sector_size: u64, api_version: ApiVersion
     with_shape!(
         sector_size,
         cache_empty_sector_update_params,
-        PoRepConfig {
-            sector_size: SectorSize(sector_size),
-            partitions: PoRepProofPartitions(
-                *POREP_PARTITIONS
-                    .read()
-                    .expect("POREP_PARTITIONS poisoned")
-                    .get(&sector_size)
-                    .expect("unknown sector size"),
-            ),
-            porep_id: [0; 32],
-            api_version,
-        }
+        PoRepConfig::new_groth16(sector_size, [0; 32], api_version)
     );
 }
 
@@ -257,7 +230,7 @@ pub fn main() {
     // If no sector-sizes were given provided via. the CLI, display an interactive menu. Otherwise,
     // filter out invalid CLI sector-size arguments.
     if opts.sector_sizes.is_empty() {
-        let sector_size_strings: Vec<String> = PUBLISHED_SECTOR_SIZES
+        let sector_size_strings: Vec<String> = SUPPORTED_SECTOR_SIZES
             .iter()
             .map(|sector_size| {
                 let human_size = sector_size
@@ -277,11 +250,11 @@ pub fn main() {
             .interact()
             .expect("interaction failed")
             .into_iter()
-            .map(|i| PUBLISHED_SECTOR_SIZES[i])
+            .map(|i| SUPPORTED_SECTOR_SIZES[i])
             .collect();
     } else {
         opts.sector_sizes.retain(|size| {
-            if PUBLISHED_SECTOR_SIZES.contains(size) {
+            if SUPPORTED_SECTOR_SIZES.contains(size) {
                 true
             } else {
                 let human_size = size

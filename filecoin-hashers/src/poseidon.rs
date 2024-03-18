@@ -40,7 +40,7 @@ pub struct PoseidonFunction(Fr);
 
 impl Default for PoseidonFunction {
     fn default() -> PoseidonFunction {
-        PoseidonFunction(Fr::zero())
+        PoseidonFunction(Fr::ZERO)
     }
 }
 
@@ -57,7 +57,7 @@ impl Hashable<PoseidonFunction> for PoseidonDomain {
 }
 
 #[derive(Default, Copy, Clone, Debug, Serialize, Deserialize)]
-pub struct PoseidonDomain(pub <Fr as PrimeField>::Repr);
+pub struct PoseidonDomain(<Fr as PrimeField>::Repr);
 
 impl AsRef<PoseidonDomain> for PoseidonDomain {
     fn as_ref(&self) -> &PoseidonDomain {
@@ -272,10 +272,8 @@ impl HashFunction<PoseidonDomain> for PoseidonFunction {
             #[allow(clippy::needless_range_loop)]
             for i in (elts.len() + 1)..arity {
                 preimage[i] =
-                    AllocatedNum::alloc(cs.namespace(|| format!("padding {}", i)), || {
-                        Ok(Fr::zero())
-                    })
-                    .expect("alloc failure");
+                    AllocatedNum::alloc(cs.namespace(|| format!("padding {}", i)), || Ok(Fr::ZERO))
+                        .expect("alloc failure");
             }
             let cs = cs.namespace(|| format!("hash md {}", hash_num));
             hash = poseidon_hash::<_, Fr, PoseidonMDArity>(cs, preimage.clone(), params)?.clone();
@@ -312,7 +310,7 @@ impl LightAlgorithm<PoseidonDomain> for PoseidonFunction {
 
     #[inline]
     fn reset(&mut self) {
-        self.0 = Fr::zero();
+        self.0 = Fr::ZERO;
     }
 
     fn leaf(&mut self, leaf: PoseidonDomain) -> PoseidonDomain {
@@ -367,6 +365,13 @@ impl From<[u8; 32]> for PoseidonDomain {
     }
 }
 
+impl From<PoseidonDomain> for [u8; 32] {
+    #[inline]
+    fn from(val: PoseidonDomain) -> Self {
+        val.0
+    }
+}
+
 impl From<PoseidonDomain> for Fr {
     #[inline]
     fn from(val: PoseidonDomain) -> Self {
@@ -393,10 +398,10 @@ mod tests {
     #[test]
     fn test_path() {
         let values = [
-            PoseidonDomain(Fr::one().to_repr()),
-            PoseidonDomain(Fr::one().to_repr()),
-            PoseidonDomain(Fr::one().to_repr()),
-            PoseidonDomain(Fr::one().to_repr()),
+            PoseidonDomain(Fr::ONE.to_repr()),
+            PoseidonDomain(Fr::ONE.to_repr()),
+            PoseidonDomain(Fr::ONE.to_repr()),
+            PoseidonDomain(Fr::ONE.to_repr()),
         ];
 
         let t = MerkleTree::<PoseidonDomain, PoseidonFunction, VecStore<_>, U2>::new(
@@ -422,10 +427,10 @@ mod tests {
     #[test]
     fn test_poseidon_hasher() {
         let leaves = [
-            PoseidonDomain(Fr::one().to_repr()),
-            PoseidonDomain(Fr::zero().to_repr()),
-            PoseidonDomain(Fr::zero().to_repr()),
-            PoseidonDomain(Fr::one().to_repr()),
+            PoseidonDomain(Fr::ONE.to_repr()),
+            PoseidonDomain(Fr::ZERO.to_repr()),
+            PoseidonDomain(Fr::ZERO.to_repr()),
+            PoseidonDomain(Fr::ONE.to_repr()),
         ];
 
         let t = MerkleTree::<PoseidonDomain, PoseidonFunction, VecStore<_>, U2>::new(
@@ -518,7 +523,7 @@ mod tests {
     fn test_hash_md() {
         // let arity = PoseidonMDArity::to_usize();
         let n = 71;
-        let data = vec![PoseidonDomain(Fr::one().to_repr()); n];
+        let data = vec![PoseidonDomain(Fr::ONE.to_repr()); n];
         let hashed = PoseidonFunction::hash_md(&data);
 
         assert_eq!(
@@ -535,12 +540,12 @@ mod tests {
     fn test_hash_md_circuit() {
         // let arity = PoseidonMDArity::to_usize();
         let n = 71;
-        let data = vec![PoseidonDomain(Fr::one().to_repr()); n];
+        let data = vec![PoseidonDomain(Fr::ONE.to_repr()); n];
 
         let mut cs = TestConstraintSystem::<Fr>::new();
         let circuit_data = (0..n)
             .map(|n| {
-                AllocatedNum::alloc(cs.namespace(|| format!("input {}", n)), || Ok(Fr::one()))
+                AllocatedNum::alloc(cs.namespace(|| format!("input {}", n)), || Ok(Fr::ONE))
                     .expect("alloc failure")
             })
             .collect::<Vec<_>>();

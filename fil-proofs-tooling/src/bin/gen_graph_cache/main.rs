@@ -12,7 +12,7 @@ use filecoin_proofs::{
 };
 use serde::{Deserialize, Serialize};
 use storage_proofs_core::{api_version::ApiVersion, merkle::MerkleTreeTrait, proof::ProofScheme};
-use storage_proofs_porep::stacked::{LayerChallenges, SetupParams, StackedDrg};
+use storage_proofs_porep::stacked::{Challenges, SetupParams, StackedDrg};
 
 const PARENT_CACHE_JSON_OUTPUT: &str = "./parent_cache.json";
 
@@ -30,21 +30,23 @@ fn gen_graph_cache<Tree: 'static + MerkleTreeTrait>(
     api_version: ApiVersion,
     parent_cache_summary_map: &mut ParentCacheSummaryMap,
 ) -> Result<()> {
-    let nodes = (sector_size / 32) as usize;
+    let nodes = sector_size / 32;
 
     // Note that layers and challenge_count don't affect the graph, so
     // we just use dummy values of 1 for the setup params.
-    let layers = 1;
+    let num_layers = 1;
     let challenge_count = 1;
-    let layer_challenges = LayerChallenges::new(layers, challenge_count);
+    let challenges = Challenges::new_interactive(challenge_count);
 
     let sp = SetupParams {
         nodes,
         degree: DRG_DEGREE,
         expansion_degree: EXP_DEGREE,
         porep_id,
-        layer_challenges,
+        challenges,
+        num_layers,
         api_version,
+        api_features: vec![],
     };
 
     let pp = StackedDrg::<Tree, Sha256Hasher>::setup(&sp).expect("failed to setup DRG");
@@ -213,7 +215,7 @@ fn main() -> Result<()> {
         }
 
         with_shape!(
-            sector_size as u64,
+            sector_size,
             gen_graph_cache,
             sector_size as usize,
             porep_id,
@@ -226,7 +228,7 @@ fn main() -> Result<()> {
     // directory.
     if json {
         let json_output_path = Path::new(PARENT_CACHE_JSON_OUTPUT);
-        let json_file = File::create(&json_output_path)?;
+        let json_file = File::create(json_output_path)?;
         let writer = BufWriter::new(json_file);
         serde_json::to_writer_pretty(writer, &parent_cache_summary_map)?;
         println!("Wrote {:?}", json_output_path);

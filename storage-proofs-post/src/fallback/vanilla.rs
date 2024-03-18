@@ -22,6 +22,8 @@ use storage_proofs_core::{
     util::{default_rows_to_discard, NODE_SIZE},
 };
 
+use super::utils::get_challenge_index;
+
 #[derive(Debug, Clone)]
 pub struct SetupParams {
     /// Size of the sector in bytes.
@@ -402,9 +404,13 @@ impl<'a, Tree: 'a + MerkleTreeTrait> ProofScheme<'a> for FallbackPoSt<'a, Tree> 
                         .fold(
                             || (Vec::new(), BTreeSet::new()),
                             |(mut inclusion_proofs, mut faults), n| {
-                                let challenge_index =
-                                    ((j * num_sectors_per_chunk + i) * pub_params.challenge_count
-                                        + n) as u64;
+                                let sector_index = j * num_sectors_per_chunk + i;
+                                let challenge_index = get_challenge_index(
+                                    pub_params.api_version,
+                                    sector_index,
+                                    pub_params.challenge_count,
+                                    n,
+                                );
                                 let challenged_leaf = generate_leaf_challenge_inner::<
                                     <Tree::Hasher as Hasher>::Domain,
                                 >(
@@ -429,12 +435,12 @@ impl<'a, Tree: 'a + MerkleTreeTrait> ProofScheme<'a> for FallbackPoSt<'a, Tree> 
                                         {
                                             inclusion_proofs.push(proof);
                                         } else {
-                                            error!("faulty sector: {:?}", sector_id);
+                                            error!("Found faulty sector: {:?}", sector_id);
                                             faults.insert(sector_id);
                                         }
                                     }
                                     Err(err) => {
-                                        error!("faulty sector: {:?} ({:?})", sector_id, err);
+                                        error!("Found faulty sector: {:?}: {:?}", sector_id, err);
                                         faults.insert(sector_id);
                                     }
                                 }
@@ -489,6 +495,7 @@ impl<'a, Tree: 'a + MerkleTreeTrait> ProofScheme<'a> for FallbackPoSt<'a, Tree> 
         if faulty_sectors.is_empty() {
             Ok(partition_proofs)
         } else {
+            trace!("Faulty sectors being reported {:?}", faulty_sectors);
             Err(Error::FaultySectors(faulty_sectors.into_iter().collect()).into())
         }
     }
@@ -629,13 +636,18 @@ impl<'a, Tree: 'a + MerkleTreeTrait> ProofScheme<'a> for FallbackPoSt<'a, Tree> 
                     .par_iter()
                     .enumerate()
                     .map(|(n, inclusion_proof)| -> Result<bool> {
-                        let challenge_index =
-                            (j * num_sectors_per_chunk + i) * pub_params.challenge_count + n;
+                        let sector_index = j * num_sectors_per_chunk + i;
+                        let challenge_index = get_challenge_index(
+                            pub_params.api_version,
+                            sector_index,
+                            pub_params.challenge_count,
+                            n,
+                        );
                         let challenged_leaf =
                             generate_leaf_challenge_inner::<<Tree::Hasher as Hasher>::Domain>(
                                 challenge_hasher.clone(),
                                 pub_params,
-                                challenge_index as u64,
+                                challenge_index,
                             );
 
                         // validate all comm_r_lasts match

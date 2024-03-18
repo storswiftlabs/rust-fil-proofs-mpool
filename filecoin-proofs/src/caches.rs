@@ -8,7 +8,9 @@ use lazy_static::lazy_static;
 use log::{info, trace};
 use once_cell::sync::OnceCell;
 use rand::rngs::OsRng;
-use storage_proofs_core::{compound_proof::CompoundProof, merkle::MerkleTreeTrait};
+use storage_proofs_core::{
+    compound_proof::CompoundProof, merkle::MerkleTreeTrait, parameter_cache::Bls12GrothParams,
+};
 use storage_proofs_porep::stacked::{StackedCompound, StackedDrg};
 use storage_proofs_post::fallback::{FallbackPoSt, FallbackPoStCircuit, FallbackPoStCompound};
 use storage_proofs_update::{
@@ -17,12 +19,11 @@ use storage_proofs_update::{
 };
 
 use crate::{
-    constants::{DefaultPieceHasher, PUBLISHED_SECTOR_SIZES},
+    constants::{DefaultPieceHasher, SUPPORTED_SECTOR_SIZES},
     parameters::{public_params, window_post_public_params, winning_post_public_params},
-    types::{PaddedBytesAmount, PoRepConfig, PoRepProofPartitions, PoStConfig, PoStType},
+    types::{PoRepConfig, PoStConfig, PoStType},
 };
 
-type Bls12GrothParams = groth16::MappedParameters<Bls12>;
 pub type Bls12PreparedVerifyingKey = groth16::PreparedVerifyingKey<Bls12>;
 type Bls12ProverSRSKey = groth16::aggregate::ProverSRS<Bls12>;
 type Bls12VerifierSRSKey = groth16::aggregate::VerifierSRS<Bls12>;
@@ -55,7 +56,7 @@ lazy_static! {
 /// cached differently (as a hashmap per type, keyed by identifier
 /// consisting of sector size and pow2 num proofs to aggregate).
 #[derive(Debug, Default)]
-pub struct SRSCache<G> {
+struct SRSCache<G> {
     data: HashMap<String, OnceCell<Arc<G>>>,
 }
 
@@ -67,7 +68,7 @@ impl<G> SRSCache<G> {
         let mut num_proofs_to_aggregate = PROOFS_TESTS_MIN_SNARKS;
 
         loop {
-            for sector_size in &PUBLISHED_SECTOR_SIZES {
+            for sector_size in &SUPPORTED_SECTOR_SIZES {
                 let key = format!(
                     "STACKED[{}-{}]-{}",
                     sector_size, num_proofs_to_aggregate, identifier,
@@ -102,7 +103,7 @@ impl<G> SRSCache<G> {
     }
 }
 
-pub fn cache_lookup<F, G>(
+fn cache_lookup<F, G>(
     cache_ref: &Mutex<Cache<G>>,
     identifier: String,
     generator: F,
@@ -133,7 +134,7 @@ where
     Ok(res)
 }
 
-pub fn srs_cache_lookup<F, G>(
+fn srs_cache_lookup<F, G>(
     cache_ref: &SRSCache<G>,
     identifier: String,
     generator: F,
@@ -151,7 +152,7 @@ where
 }
 
 #[inline]
-pub fn lookup_groth_params<F>(identifier: String, generator: F) -> Result<Arc<Bls12GrothParams>>
+fn lookup_groth_params<F>(identifier: String, generator: F) -> Result<Arc<Bls12GrothParams>>
 where
     F: FnOnce() -> Result<Bls12GrothParams>,
 {
@@ -159,7 +160,7 @@ where
 }
 
 #[inline]
-pub fn lookup_verifying_key<F>(
+fn lookup_verifying_key<F>(
     identifier: String,
     generator: F,
 ) -> Result<Arc<Bls12PreparedVerifyingKey>>
@@ -171,7 +172,7 @@ where
 }
 
 #[inline]
-pub fn lookup_srs_key<F>(identifier: String, generator: F) -> Result<Arc<Bls12ProverSRSKey>>
+fn lookup_srs_key<F>(identifier: String, generator: F) -> Result<Arc<Bls12ProverSRSKey>>
 where
     F: FnOnce() -> Result<Bls12ProverSRSKey>,
 {
@@ -180,10 +181,7 @@ where
 }
 
 #[inline]
-pub fn lookup_srs_verifier_key<F>(
-    identifier: String,
-    generator: F,
-) -> Result<Arc<Bls12VerifierSRSKey>>
+fn lookup_srs_verifier_key<F>(identifier: String, generator: F) -> Result<Arc<Bls12VerifierSRSKey>>
 where
     F: FnOnce() -> Result<Bls12VerifierSRSKey>,
 {
@@ -195,15 +193,10 @@ where
     )
 }
 
-pub fn get_stacked_params<Tree: 'static + MerkleTreeTrait>(
-    porep_config: PoRepConfig,
+pub(crate) fn get_stacked_params<Tree: 'static + MerkleTreeTrait>(
+    porep_config: &PoRepConfig,
 ) -> Result<Arc<Bls12GrothParams>> {
-    let public_params = public_params::<Tree>(
-        PaddedBytesAmount::from(porep_config),
-        usize::from(PoRepProofPartitions::from(porep_config)),
-        porep_config.porep_id,
-        porep_config.api_version,
-    )?;
+    let public_params = public_params::<Tree>(porep_config)?;
 
     let parameters_generator = || {
         <StackedCompound<Tree, DefaultPieceHasher> as CompoundProof<
@@ -216,13 +209,13 @@ pub fn get_stacked_params<Tree: 'static + MerkleTreeTrait>(
     lookup_groth_params(
         format!(
             "STACKED[{}]",
-            usize::from(PaddedBytesAmount::from(porep_config))
+            usize::from(porep_config.padded_bytes_amount())
         ),
         parameters_generator,
     )
 }
 
-pub fn get_post_params<Tree: 'static + MerkleTreeTrait>(
+pub(crate) fn get_post_params<Tree: 'static + MerkleTreeTrait>(
     post_config: &PoStConfig,
 ) -> Result<Arc<Bls12GrothParams>> {
     match post_config.typ {
@@ -267,8 +260,10 @@ pub fn get_post_params<Tree: 'static + MerkleTreeTrait>(
     }
 }
 
-pub fn get_empty_sector_update_params<Tree: 'static + MerkleTreeTrait<Hasher = TreeRHasher>>(
-    porep_config: PoRepConfig,
+pub(crate) fn get_empty_sector_update_params<
+    Tree: 'static + MerkleTreeTrait<Hasher = TreeRHasher>,
+>(
+    porep_config: &PoRepConfig,
 ) -> Result<Arc<Bls12GrothParams>> {
     let public_params: storage_proofs_update::PublicParams =
         PublicParams::from_sector_size(u64::from(porep_config.sector_size));
@@ -284,21 +279,16 @@ pub fn get_empty_sector_update_params<Tree: 'static + MerkleTreeTrait<Hasher = T
     lookup_groth_params(
         format!(
             "SECTOR-UPDATE[{}]",
-            usize::from(PaddedBytesAmount::from(porep_config))
+            usize::from(porep_config.padded_bytes_amount())
         ),
         parameters_generator,
     )
 }
 
-pub fn get_stacked_verifying_key<Tree: 'static + MerkleTreeTrait>(
-    porep_config: PoRepConfig,
+pub(crate) fn get_stacked_verifying_key<Tree: 'static + MerkleTreeTrait>(
+    porep_config: &PoRepConfig,
 ) -> Result<Arc<Bls12PreparedVerifyingKey>> {
-    let public_params = public_params(
-        PaddedBytesAmount::from(porep_config),
-        usize::from(PoRepProofPartitions::from(porep_config)),
-        porep_config.porep_id,
-        porep_config.api_version,
-    )?;
+    let public_params = public_params(porep_config)?;
 
     let vk_generator = || {
         let vk = <StackedCompound<Tree, DefaultPieceHasher> as CompoundProof<
@@ -311,13 +301,13 @@ pub fn get_stacked_verifying_key<Tree: 'static + MerkleTreeTrait>(
     lookup_verifying_key(
         format!(
             "STACKED[{}]",
-            usize::from(PaddedBytesAmount::from(porep_config))
+            usize::from(porep_config.padded_bytes_amount())
         ),
         vk_generator,
     )
 }
 
-pub fn get_post_verifying_key<Tree: 'static + MerkleTreeTrait>(
+pub(crate) fn get_post_verifying_key<Tree: 'static + MerkleTreeTrait>(
     post_config: &PoStConfig,
 ) -> Result<Arc<Bls12PreparedVerifyingKey>> {
     match post_config.typ {
@@ -362,21 +352,17 @@ pub fn get_post_verifying_key<Tree: 'static + MerkleTreeTrait>(
     }
 }
 
+// It is not pub(crate) only because there is a benchmark using it.
 pub fn get_stacked_srs_key<Tree: 'static + MerkleTreeTrait>(
-    porep_config: PoRepConfig,
+    porep_config: &PoRepConfig,
     num_proofs_to_aggregate: usize,
 ) -> Result<Arc<Bls12ProverSRSKey>> {
-    let public_params = public_params(
-        PaddedBytesAmount::from(porep_config),
-        usize::from(PoRepProofPartitions::from(porep_config)),
-        porep_config.porep_id,
-        porep_config.api_version,
-    )?;
+    let public_params = public_params(porep_config)?;
 
     let srs_generator = || {
         trace!(
             "get_stacked_srs_key specializing STACKED[{}-{}]",
-            usize::from(PaddedBytesAmount::from(porep_config)),
+            usize::from(porep_config.padded_bytes_amount()),
             num_proofs_to_aggregate,
         );
         <StackedCompound<Tree, DefaultPieceHasher> as CompoundProof<
@@ -388,28 +374,24 @@ pub fn get_stacked_srs_key<Tree: 'static + MerkleTreeTrait>(
     lookup_srs_key(
         format!(
             "STACKED[{}-{}]",
-            usize::from(PaddedBytesAmount::from(porep_config)),
+            usize::from(porep_config.padded_bytes_amount()),
             num_proofs_to_aggregate,
         ),
         srs_generator,
     )
 }
 
+// It is not pub(crate) only because there is a benchmark using it.
 pub fn get_stacked_srs_verifier_key<Tree: 'static + MerkleTreeTrait>(
-    porep_config: PoRepConfig,
+    porep_config: &PoRepConfig,
     num_proofs_to_aggregate: usize,
 ) -> Result<Arc<Bls12VerifierSRSKey>> {
-    let public_params = public_params(
-        PaddedBytesAmount::from(porep_config),
-        usize::from(PoRepProofPartitions::from(porep_config)),
-        porep_config.porep_id,
-        porep_config.api_version,
-    )?;
+    let public_params = public_params(porep_config)?;
 
     let srs_verifier_generator = || {
         trace!(
             "get_stacked_srs_verifier_key specializing STACKED[{}-{}]",
-            usize::from(PaddedBytesAmount::from(porep_config)),
+            usize::from(porep_config.padded_bytes_amount()),
             num_proofs_to_aggregate,
         );
         <StackedCompound<Tree, DefaultPieceHasher> as CompoundProof<
@@ -423,17 +405,17 @@ pub fn get_stacked_srs_verifier_key<Tree: 'static + MerkleTreeTrait>(
     lookup_srs_verifier_key(
         format!(
             "STACKED[{}-{}]",
-            usize::from(PaddedBytesAmount::from(porep_config)),
+            usize::from(porep_config.padded_bytes_amount()),
             num_proofs_to_aggregate,
         ),
         srs_verifier_generator,
     )
 }
 
-pub fn get_empty_sector_update_verifying_key<
+pub(crate) fn get_empty_sector_update_verifying_key<
     Tree: 'static + MerkleTreeTrait<Hasher = TreeRHasher>,
 >(
-    porep_config: PoRepConfig,
+    porep_config: &PoRepConfig,
 ) -> Result<Arc<Bls12PreparedVerifyingKey>> {
     let public_params: storage_proofs_update::PublicParams =
         PublicParams::from_sector_size(u64::from(porep_config.sector_size));
@@ -449,7 +431,7 @@ pub fn get_empty_sector_update_verifying_key<
     lookup_verifying_key(
         format!(
             "SECTOR-UPDATE[{}]",
-            usize::from(PaddedBytesAmount::from(porep_config))
+            usize::from(porep_config.padded_bytes_amount())
         ),
         vk_generator,
     )

@@ -12,7 +12,7 @@ use filecoin_proofs::{
 };
 use log::info;
 use serde::Serialize;
-use storage_proofs_core::api_version::ApiVersion;
+use storage_proofs_core::api_version::{ApiFeature, ApiVersion};
 use storage_proofs_core::merkle::MerkleTreeTrait;
 
 #[derive(Serialize)]
@@ -52,15 +52,15 @@ pub fn run_fallback_post_bench<Tree: 'static + MerkleTreeTrait>(
     sector_size: u64,
     fake_replica: bool,
     api_version: ApiVersion,
+    api_features: Vec<ApiFeature>,
 ) -> anyhow::Result<()> {
     if WINNING_POST_SECTOR_COUNT != 1 {
         return Err(anyhow!(
             "This benchmark only works with WINNING_POST_SECTOR_COUNT == 1"
         ));
     }
-    let arbitrary_porep_id = [66; 32];
     let (sector_id, replica_output) =
-        create_replica::<Tree>(sector_size, arbitrary_porep_id, fake_replica, api_version);
+        create_replica::<Tree>(sector_size, fake_replica, api_version, api_features);
 
     // Store the replica's private and publicly facing info for proving and verifying respectively.
     let pub_replica_info = vec![(sector_id, replica_output.public_replica_info.clone())];
@@ -104,8 +104,8 @@ pub fn run_fallback_post_bench<Tree: 'static + MerkleTreeTrait>(
     .expect("failed to verify winning post proof");
 
     // Clean-up sealed file and cache_dir.
-    remove_file(&replica_output.private_replica_info.replica_path())?;
-    remove_dir_all(&replica_output.private_replica_info.cache_dir_path())?;
+    remove_file(replica_output.private_replica_info.replica_path())?;
+    remove_dir_all(replica_output.private_replica_info.cache_dir_path())?;
 
     // Create a JSON serializable report that we print to stdout (that will later be parsed using
     // the CLI JSON parser `jq`).
@@ -136,7 +136,12 @@ pub fn run_fallback_post_bench<Tree: 'static + MerkleTreeTrait>(
     Ok(())
 }
 
-pub fn run(sector_size: usize, fake_replica: bool, api_version: ApiVersion) -> anyhow::Result<()> {
+pub fn run(
+    sector_size: usize,
+    fake_replica: bool,
+    api_version: ApiVersion,
+    api_features: Vec<ApiFeature>,
+) -> anyhow::Result<()> {
     info!(
         "Benchy Winning PoSt: sector-size={}, fake_replica={}, api_version={}",
         sector_size, fake_replica, api_version
@@ -148,5 +153,6 @@ pub fn run(sector_size: usize, fake_replica: bool, api_version: ApiVersion) -> a
         sector_size as u64,
         fake_replica,
         api_version,
+        api_features,
     )
 }

@@ -1,13 +1,13 @@
 use anyhow::ensure;
 use filecoin_hashers::{HashFunction, Hasher};
-use log::trace;
+use log::{error, trace};
 use rayon::prelude::{IndexedParallelIterator, IntoParallelRefIterator, ParallelIterator};
 use storage_proofs_core::{
     drgraph::Graph, error::Result, merkle::MerkleTreeTrait, proof::ProofScheme,
 };
 
 use crate::stacked::vanilla::{
-    challenges::ChallengeRequirements,
+    challenges::{ChallengeRequirements, Challenges},
     graph::StackedBucketGraph,
     params::{PrivateInputs, Proof, PublicInputs, PublicParams, SetupParams},
     proof::StackedDrg,
@@ -32,7 +32,11 @@ impl<'a, 'c, Tree: 'static + MerkleTreeTrait, G: 'static + Hasher> ProofScheme<'
             sp.api_version,
         )?;
 
-        Ok(PublicParams::new(graph, sp.layer_challenges.clone()))
+        Ok(PublicParams::new(
+            graph,
+            sp.challenges.clone(),
+            sp.num_layers,
+        ))
     }
 
     fn prove<'b>(
@@ -67,8 +71,8 @@ impl<'a, 'c, Tree: 'static + MerkleTreeTrait, G: 'static + Hasher> ProofScheme<'
             pub_inputs,
             &priv_inputs.p_aux,
             &priv_inputs.t_aux,
-            &pub_params.layer_challenges,
-            pub_params.layer_challenges.layers(),
+            &pub_params.challenges,
+            pub_params.num_layers,
             partition_count,
         )
     }
@@ -89,12 +93,24 @@ impl<'a, 'c, Tree: 'static + MerkleTreeTrait, G: 'static + Hasher> ProofScheme<'
             return Ok(false);
         };
 
+        // If the caller attempts to verify generated synthetic vanilla proofs, return early
+        // (without error) as the synthetic prover validated the synthetic proofs prior to writing
+        // them to disk.
+        let skip_synth_verification =
+            matches!(pub_params.challenges, Challenges::Synth(_)) && pub_inputs.seed.is_none();
+        if skip_synth_verification {
+            trace!("synthetic proofs already verified; skipping re-verification");
+            return Ok(true);
+        }
+
+        ensure!(
+            pub_inputs.seed.is_some(),
+            "porep challenge seed must be set to verify vanilla proofs",
+        );
+
+        let partitions = partition_proofs.len();
         let res = partition_proofs.par_iter().enumerate().all(|(k, proofs)| {
-            trace!(
-                "verifying partition proof {}/{}",
-                k + 1,
-                partition_proofs.len()
-            );
+            trace!("verifying partition proof {}/{}", k + 1, partitions);
 
             trace!("verify comm_r");
             let actual_comm_r: <Tree::Hasher as Hasher>::Domain = {
@@ -107,8 +123,17 @@ impl<'a, 'c, Tree: 'static + MerkleTreeTrait, G: 'static + Hasher> ProofScheme<'
                 return false;
             }
 
-            let challenges =
-                pub_inputs.challenges(&pub_params.layer_challenges, graph.size(), Some(k));
+            let challenges = pub_inputs.challenges(&pub_params.challenges, graph.size(), Some(k));
+
+            let (num_proofs, num_challenges) = (proofs.len(), challenges.len());
+            if num_proofs != num_challenges {
+                error!(
+                    "partition proof length does not equal number of partition challenges \
+                    (k = {}, num_challenge_proofs = {}, num_challenges = {})",
+                    k, num_proofs, num_challenges,
+                );
+                return false;
+            }
 
             proofs.par_iter().enumerate().all(|(i, proof)| {
                 trace!("verify challenge {}/{}", i + 1, challenges.len());
@@ -146,7 +171,7 @@ impl<'a, 'c, Tree: 'static + MerkleTreeTrait, G: 'static + Hasher> ProofScheme<'
         requirements: &ChallengeRequirements,
         partitions: usize,
     ) -> bool {
-        let partition_challenges = public_params.layer_challenges.challenges_count_all();
+        let partition_challenges = public_params.challenges.num_challenges_per_partition();
 
         assert_eq!(
             partition_challenges.checked_mul(partitions),

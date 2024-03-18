@@ -165,7 +165,7 @@ impl<H: Hasher> Graph<H> for BucketGraph<H> {
 
                 let (predecessor_index, other_drg_parents) = match self.api_version {
                     ApiVersion::V1_0_0 => (m_prime, &mut parents[..]),
-                    ApiVersion::V1_1_0 => (0, &mut parents[1..]),
+                    ApiVersion::V1_1_0 | ApiVersion::V1_2_0 => (0, &mut parents[1..]),
                 };
 
                 for parent in other_drg_parents.iter_mut().take(m_prime) {
@@ -259,7 +259,7 @@ mod tests {
         blake2s::Blake2sHasher, poseidon::PoseidonHasher, sha256::Sha256Hasher,
     };
     use generic_array::typenum::{U0, U2, U4, U8};
-    use memmap::{MmapMut, MmapOptions};
+    use memmap2::{MmapMut, MmapOptions};
     use merkletree::store::StoreConfig;
 
     use crate::merkle::{
@@ -291,7 +291,7 @@ mod tests {
         let new_porep_id = porep_id(5);
 
         graph_bucket_aux::<H>(legacy_porep_id, ApiVersion::V1_0_0);
-        graph_bucket_aux::<H>(new_porep_id, ApiVersion::V1_1_0);
+        graph_bucket_aux::<H>(new_porep_id, ApiVersion::V1_2_0);
     }
 
     fn graph_bucket_aux<H: Hasher>(porep_id: PoRepID, api_version: ApiVersion) {
@@ -305,10 +305,10 @@ mod tests {
 
             let mut parents = vec![0; degree];
             g.parents(0, &mut parents).expect("parents failed");
-            assert_eq!(parents, vec![0; degree as usize]);
+            assert_eq!(parents, vec![0; degree]);
             parents = vec![0; degree];
             g.parents(1, &mut parents).expect("parents failed");
-            assert_eq!(parents, vec![0; degree as usize]);
+            assert_eq!(parents, vec![0; degree]);
 
             for i in 1..size {
                 let mut pa1 = vec![0; degree];
@@ -337,7 +337,7 @@ mod tests {
                             "immediate predecessor was not last DRG parent"
                         );
                     }
-                    ApiVersion::V1_1_0 => {
+                    ApiVersion::V1_1_0 | ApiVersion::V1_2_0 => {
                         assert_eq!(
                             i - 1,
                             pa1[0] as usize,
@@ -362,7 +362,7 @@ mod tests {
     fn gen_proof<H: 'static + Hasher, U: 'static + PoseidonArity>(config: Option<StoreConfig>) {
         let leafs = 64;
         let porep_id = [1; 32];
-        let g = BucketGraph::<H>::new(leafs, BASE_DEGREE, 0, porep_id, ApiVersion::V1_1_0)
+        let g = BucketGraph::<H>::new(leafs, BASE_DEGREE, 0, porep_id, ApiVersion::V1_2_0)
             .expect("bucket graph new failed");
         let data = vec![2u8; NODE_SIZE * leafs];
 

@@ -17,10 +17,11 @@ use filecoin_proofs::{
     WINNING_POST_SECTOR_COUNT,
 };
 use log::{debug, info};
-use storage_proofs_core::api_version::ApiVersion;
+use storage_proofs_core::api_version::{ApiFeature, ApiVersion};
 use storage_proofs_core::sector::SectorId;
 
-const FIXED_API_VERSION: ApiVersion = ApiVersion::V1_0_0;
+const FIXED_API_VERSION: ApiVersion = ApiVersion::V1_2_0;
+const FIXED_API_FEATURES: Vec<ApiFeature> = Vec::new();
 
 type MerkleTree = SectorShape8MiB;
 const SECTOR_SIZE: u64 = SECTOR_SIZE_8_MIB;
@@ -152,11 +153,10 @@ fn threads_mode(parallel: u8, gpu_stealing: bool) {
     let mut senders = Vec::new();
     // All thread handles that get terminated
     let mut threads: Vec<Option<thread::JoinHandle<_>>> = Vec::new();
-    let arbitrary_porep_id = [234; 32];
 
     // Create fixtures only once for both threads
     let (sector_id, replica_output) =
-        create_replica::<MerkleTree>(SECTOR_SIZE, arbitrary_porep_id, false, FIXED_API_VERSION);
+        create_replica::<MerkleTree>(SECTOR_SIZE, false, FIXED_API_VERSION, FIXED_API_FEATURES);
     let priv_replica_info = (sector_id, replica_output.private_replica_info);
 
     // Put each proof into it's own scope (the other one is due to the if statement)
@@ -229,11 +229,11 @@ fn spawn_process(name: &str, gpu_stealing: bool) -> Child {
     Command::new("cargo")
         .arg("run")
         .arg("--release")
-        .args(&["--bin", "gpu-cpu-test"])
+        .args(["--bin", "gpu-cpu-test"])
         .arg("--")
-        .args(&["--gpu-stealing", &gpu_stealing.to_string()])
-        .args(&["--parallel", "1"])
-        .args(&["--mode", "threads"])
+        .args(["--gpu-stealing", &gpu_stealing.to_string()])
+        .args(["--parallel", "1"])
+        .args(["--mode", "threads"])
         // Print logging to the main process stderr
         .stderr(Stdio::inherit())
         // Use the stdout to return a result
@@ -268,7 +268,7 @@ fn main() {
             Arg::new("mode")
               .long("mode")
               .help("Whether to run with threads or processes.")
-              .possible_values(&["threads", "processes"])
+              .possible_values(["threads", "processes"])
               .ignore_case(true)
               .default_value("threads"),
         )

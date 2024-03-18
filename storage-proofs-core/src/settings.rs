@@ -1,8 +1,12 @@
+use std::any::TypeId;
 use std::env;
 
 use config::{Config, ConfigError, Environment, File};
+use filecoin_hashers::poseidon::PoseidonHasher;
 use lazy_static::lazy_static;
 use serde::{Deserialize, Serialize};
+
+use crate::merkle::MerkleTreeTrait;
 
 lazy_static! {
     pub static ref SETTINGS: Settings = Settings::new().expect("invalid configuration");
@@ -10,6 +14,7 @@ lazy_static! {
 
 const SETTINGS_PATH: &str = "./rust-fil-proofs.config.toml";
 const PREFIX: &str = "FIL_PROOFS";
+pub const DEFAULT_ROWS_TO_DISCARD: u32 = 2;
 
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(default)]
@@ -47,7 +52,7 @@ impl Default for Settings {
             column_write_batch_size: 262_144,
             use_gpu_tree_builder: false,
             max_gpu_tree_batch_size: 700_000,
-            rows_to_discard: 2,
+            rows_to_discard: DEFAULT_ROWS_TO_DISCARD,
             sdr_parents_cache_size: 2_048,
             window_post_synthesis_num_cpus: num_cpus::get() as u32,
             // `parameter_cache` does not use the cache() mechanism because it is now used
@@ -107,5 +112,17 @@ impl Settings {
             .add_source(Environment::with_prefix(PREFIX))
             .build()?
             .try_deserialize()
+    }
+
+    // Even if the column builder is enabled, the GPU column builder
+    // only supports Poseidon hashes.
+    pub fn use_gpu_column_builder<Tree: MerkleTreeTrait>(&self) -> bool {
+        self.use_gpu_tree_builder && TypeId::of::<Tree::Hasher>() == TypeId::of::<PoseidonHasher>()
+    }
+
+    // Even if the tree builder is enabled, the GPU tree builder
+    // only supports Poseidon hashes.
+    pub fn use_gpu_tree_builder<Tree: MerkleTreeTrait>(&self) -> bool {
+        self.use_gpu_tree_builder && TypeId::of::<Tree::Hasher>() == TypeId::of::<PoseidonHasher>()
     }
 }

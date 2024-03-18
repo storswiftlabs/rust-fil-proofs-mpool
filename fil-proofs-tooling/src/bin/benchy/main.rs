@@ -1,23 +1,31 @@
 //requires nightly, or later stable version
 //#![warn(clippy::unwrap_used)]
 
-use std::io::{stdin, stdout};
 use std::str::FromStr;
 
 use anyhow::Result;
 use byte_unit::Byte;
-use clap::{Arg, Command};
+use clap::{builder::PossibleValuesParser, Arg, ArgMatches, Command};
 
-use storage_proofs_core::api_version::ApiVersion;
-
-use crate::prodbench::ProdbenchInputs;
+use storage_proofs_core::api_version::{ApiFeature, ApiVersion};
 
 mod hash_fns;
 mod merkleproofs;
-mod prodbench;
+mod porep;
 mod window_post;
 mod window_post_fake;
 mod winning_post;
+
+const API_FEATURES: [&str; 2] = ["synthetic-porep", "non-interactive-porep"];
+
+fn parse_api_features(m: &ArgMatches) -> Result<Vec<ApiFeature>> {
+    match m.get_many::<String>("api_features") {
+        Some(api_features) => api_features
+            .map(|api_feature| ApiFeature::from_str(api_feature))
+            .collect::<Result<_, _>>(),
+        None => Ok(Vec::new()),
+    }
+}
 
 fn main() -> Result<()> {
     fil_logger::init();
@@ -82,10 +90,26 @@ fn main() -> Result<()> {
                 .takes_value(true),
         )
         .arg(
+            Arg::new("task_numbers")
+                .long("task-numbers")
+                .required(false)
+                .help("The window-post parallels task numbers")
+                .default_value("1")
+                .takes_value(true),
+        )
+        .arg(
+            Arg::new("api_features")
+                .long("api-features")
+                .value_delimiter(',')
+                .value_parser(PossibleValuesParser::new(API_FEATURES))
+                .help("The api_features to use, comma separated (e.g. synthetic-porep)")
+                .takes_value(true),
+        )
+        .arg(
             Arg::new("api_version")
                 .long("api-version")
-                .help("The api_version to use (default: 1.1.0)")
-                .default_value("1.1.0")
+                .help("The api_version to use (default: 1.2.0)")
+                .default_value("1.2.0")
                 .takes_value(true),
         );
 
@@ -105,10 +129,18 @@ fn main() -> Result<()> {
                 .takes_value(false),
         )
         .arg(
+            Arg::new("api_features")
+                .long("api-features")
+                .value_delimiter(',')
+                .value_parser(PossibleValuesParser::new(API_FEATURES))
+                .help("The api_features to use, comma separated (e.g. synthetic-porep)")
+                .takes_value(true),
+        )
+        .arg(
             Arg::new("api_version")
                 .long("api-version")
-                .help("The api_version to use (default: 1.1.0)")
-                .default_value("1.1.0")
+                .help("The api_version to use (default: 1.2.0)")
+                .default_value("1.2.0")
                 .takes_value(true),
         );
 
@@ -128,48 +160,105 @@ fn main() -> Result<()> {
                 .takes_value(false),
         )
         .arg(
+            Arg::new("api_features")
+                .long("api-features")
+                .value_delimiter(',')
+                .value_parser(PossibleValuesParser::new(API_FEATURES))
+                .help("The api_features to use, comma separated (e.g. synthetic-porep)")
+                .takes_value(true),
+        )
+        .arg(
             Arg::new("api_version")
                 .long("api-version")
-                .help("The api_version to use (default: 1.1.0)")
-                .default_value("1.1.0")
+                .help("The api_version to use (default: 1.2.0)")
+                .default_value("1.2.0")
                 .takes_value(true),
         );
 
     let hash_cmd =
         Command::new("hash-constraints").about("Benchmark hash function inside of a circuit");
 
-    let prodbench_cmd = Command::new("prodbench")
-        .about("Benchmark prodbench")
+    let porep_cmd = Command::new("porep")
+        .about("Benchmark PoRep")
         .arg(
-            Arg::new("config")
-                .long("config")
-                .takes_value(true)
+            Arg::new("preserve-cache")
+                .long("preserve-cache")
                 .required(false)
-                .help("path to config.json"),
+                .help("Preserve the directory where cached files are persisted")
+                .takes_value(false),
         )
         .arg(
-            Arg::new("skip-seal-proof")
-                .long("skip-seal-proof")
-                .takes_value(false)
-                .help("skip generation (and verification) of seal proof"),
+            Arg::new("skip-precommit-phase1")
+                .long("skip-precommit-phase1")
+                .required(false)
+                .help("Skip precommit phase 1")
+                .takes_value(false),
         )
         .arg(
-            Arg::new("skip-post-proof")
-                .long("skip-post-proof")
-                .takes_value(false)
-                .help("skip generation (and verification) of PoSt proof"),
+            Arg::new("skip-precommit-phase2")
+                .long("skip-precommit-phase2")
+                .required(false)
+                .help("Skip precommit phase 2")
+                .takes_value(false),
         )
         .arg(
-            Arg::new("only-replicate")
-                .long("only-replicate")
-                .takes_value(false)
-                .help("only run replication"),
+            Arg::new("skip-commit-phase1")
+                .long("skip-commit-phase1")
+                .required(false)
+                .help("Skip commit phase 1")
+                .takes_value(false),
         )
         .arg(
-            Arg::new("only-add-piece")
-                .long("only-add-piece")
-                .takes_value(false)
-                .help("only run piece addition"),
+            Arg::new("skip-commit-phase2")
+                .long("skip-commit-phase2")
+                .required(false)
+                .help("Skip commit phase 2")
+                .takes_value(false),
+        )
+        .arg(
+            Arg::new("test-resume")
+                .long("test-resume")
+                .required(false)
+                .help("Test replication resume")
+                .takes_value(false),
+        )
+        .arg(
+            Arg::new("cache")
+                .long("cache")
+                .required(false)
+                .help("The directory where cached files are persisted")
+                .default_value("")
+                .takes_value(true),
+        )
+        .arg(
+            Arg::new("size")
+                .long("size")
+                .required(true)
+                .help("The data size (e.g. 2KiB)")
+                .takes_value(true),
+        )
+        .arg(
+            Arg::new("task_numbers")
+                .long("task-numbers")
+                .required(false)
+                .help("The window-post parallels task numbers")
+                .default_value("1")
+                .takes_value(true),
+        )
+        .arg(
+            Arg::new("api_features")
+                .long("api-features")
+                .value_delimiter(',')
+                .value_parser(PossibleValuesParser::new(API_FEATURES))
+                .help("The api_features to use, comma separated (e.g. synthetic-porep)")
+                .takes_value(true),
+        )
+        .arg(
+            Arg::new("api_version")
+                .long("api-version")
+                .help("The api_version to use (default: 1.2.0)")
+                .default_value("1.2.0")
+                .takes_value(true),
         );
 
     let merkleproof_cmd = Command::new("merkleproofs")
@@ -205,7 +294,7 @@ fn main() -> Result<()> {
         .subcommand(window_post_fake_cmd)
         .subcommand(winning_post_cmd)
         .subcommand(hash_cmd)
-        .subcommand(prodbench_cmd)
+        .subcommand(porep_cmd)
         .subcommand(merkleproof_cmd)
         .get_matches();
 
@@ -221,29 +310,67 @@ fn main() -> Result<()> {
             let cache_dir = m.value_of_t::<String>("cache")?;
             let sector_size = Byte::from_str(m.value_of_t::<String>("size")?)?.get_bytes() as usize;
             let api_version = ApiVersion::from_str(&m.value_of_t::<String>("api_version")?)?;
-            window_post::run(
-                sector_size,
-                api_version,
-                cache_dir,
-                preserve_cache,
-                skip_precommit_phase1,
-                skip_precommit_phase2,
-                skip_commit_phase1,
-                skip_commit_phase2,
-                test_resume,
-            )?;
+            let api_features = parse_api_features(m)?;
+            let task_numbers = m.value_of_t::<usize>("task_numbers")?;
+
+            if task_numbers == 1 {
+                window_post::run(
+                    sector_size,
+                    api_version,
+                    cache_dir,
+                    preserve_cache,
+                    skip_precommit_phase1,
+                    skip_precommit_phase2,
+                    skip_commit_phase1,
+                    skip_commit_phase2,
+                    test_resume,
+                    api_features,
+                )?;
+            } else {
+                let cache_dir: Vec<&str> = cache_dir.split(',').collect();
+                if cache_dir.len() != task_numbers {
+                    panic!("cache_dir.len() != task_numbers");
+                }
+                let mut children = Vec::new();
+                for dir in cache_dir.iter().take(task_numbers) {
+                    let task_dir = String::from(*dir);
+                    let api_features_clone = api_features.clone();
+                    let t = std::thread::spawn(move || {
+                        window_post::run(
+                            sector_size,
+                            api_version,
+                            task_dir,
+                            preserve_cache,
+                            skip_precommit_phase1,
+                            skip_precommit_phase2,
+                            skip_commit_phase1,
+                            skip_commit_phase2,
+                            test_resume,
+                            api_features_clone,
+                        )
+                        .expect("window_post run error");
+                    });
+                    children.push(t);
+                }
+
+                for child in children {
+                    child.join().expect("oops! the child thread panicked");
+                }
+            }
         }
         Some(("winning-post", m)) => {
             let sector_size = Byte::from_str(m.value_of_t::<String>("size")?)?.get_bytes() as usize;
             let fake_replica = m.is_present("fake");
             let api_version = ApiVersion::from_str(&m.value_of_t::<String>("api_version")?)?;
-            winning_post::run(sector_size, fake_replica, api_version)?;
+            let api_features = parse_api_features(m)?;
+            winning_post::run(sector_size, fake_replica, api_version, api_features)?;
         }
         Some(("window-post-fake", m)) => {
             let sector_size = Byte::from_str(m.value_of_t::<String>("size")?)?.get_bytes() as usize;
             let fake_replica = m.is_present("fake");
             let api_version = ApiVersion::from_str(&m.value_of_t::<String>("api_version")?)?;
-            window_post_fake::run(sector_size, fake_replica, api_version)?;
+            let api_features = parse_api_features(m)?;
+            window_post_fake::run(sector_size, fake_replica, api_version, api_features)?;
         }
         Some(("hash-constraints", _m)) => {
             hash_fns::run()?;
@@ -254,30 +381,31 @@ fn main() -> Result<()> {
             let proofs = m.value_of_t::<usize>("proofs")?;
             merkleproofs::run(size, proofs, m.is_present("validate"))?;
         }
-        Some(("prodbench", m)) => {
-            let inputs: ProdbenchInputs = if m.is_present("config") {
-                let file = m
-                    .value_of_t::<String>("config")
-                    .expect("failed to get config");
-                serde_json::from_reader(
-                    std::fs::File::open(&file)
-                        .unwrap_or_else(|_| panic!("invalid file {:?}", file)),
-                )
-            } else {
-                serde_json::from_reader(stdin())
-            }
-            .expect("failed to deserialize stdin to ProdbenchInputs");
+        Some(("porep", m)) => {
+            let preserve_cache = m.is_present("preserve-cache");
+            // For now these options are combined.
+            let skip_precommit_phase1 = m.is_present("skip-precommit-phase1");
+            let skip_precommit_phase2 = m.is_present("skip-precommit-phase2");
+            let skip_commit_phase1 = m.is_present("skip-commit-phase1");
+            let skip_commit_phase2 = m.is_present("skip-commit-phase2");
+            let test_resume = m.is_present("test-resume");
+            let cache_dir = m.value_of_t::<String>("cache")?;
+            let sector_size = Byte::from_str(m.value_of_t::<String>("size")?)?.get_bytes() as usize;
+            let api_version = ApiVersion::from_str(&m.value_of_t::<String>("api_version")?)?;
+            let api_features = parse_api_features(m)?;
 
-            let outputs = prodbench::run(
-                inputs,
-                m.is_present("skip-seal-proof"),
-                m.is_present("skip-post-proof"),
-                m.is_present("only-replicate"),
-                m.is_present("only-add-piece"),
-            );
-
-            serde_json::to_writer(stdout(), &outputs)
-                .expect("failed to write ProdbenchOutput to stdout")
+            porep::run(
+                sector_size,
+                api_version,
+                api_features,
+                cache_dir,
+                preserve_cache,
+                skip_precommit_phase1,
+                skip_precommit_phase2,
+                skip_commit_phase1,
+                skip_commit_phase2,
+                test_resume,
+            )?;
         }
         _ => unreachable!(),
     }

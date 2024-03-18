@@ -1,96 +1,51 @@
-use std::fs::{self, File};
-use std::io::Write;
+use std::cmp;
+use std::fs;
+use std::io::{Read, Write};
 use std::path::Path;
 
 use anyhow::{ensure, Context, Result};
-use bincode::{deserialize, serialize};
+use bellperson::groth16;
+use blstrs::Scalar as Fr;
+use ff::PrimeField;
 use filecoin_hashers::{Domain, Hasher};
+use fr32::bytes_into_fr;
 use generic_array::typenum::Unsigned;
 use log::{info, trace};
 use merkletree::merkle::get_merkle_tree_len;
 use merkletree::store::StoreConfig;
+use rayon::prelude::*;
+use sha2::{Digest, Sha256};
 use storage_proofs_core::{
-    cache_key::CacheKey,
+    api_version::ApiVersion,
     compound_proof::{self, CompoundProof},
     merkle::{get_base_tree_count, MerkleTreeTrait},
     multi_proof::MultiProof,
     proof::ProofScheme,
+    util::NODE_SIZE,
 };
-use storage_proofs_porep::stacked::{PersistentAux, TemporaryAux};
+use storage_proofs_porep::stacked::TemporaryAux;
 use storage_proofs_update::{
-    constants::TreeDArity, constants::TreeRHasher, EmptySectorUpdate, EmptySectorUpdateCompound,
-    PartitionProof, PrivateInputs, PublicInputs, PublicParams, SetupParams,
+    constants::{h_default, TreeDArity, TreeDDomain, TreeRDomain, TreeRHasher},
+    phi,
+    vanilla::Rhos,
+    EmptySectorUpdate, EmptySectorUpdateCompound, PartitionProof, PrivateInputs, PublicInputs,
+    PublicParams, SetupParams,
 };
 
 use crate::{
-    caches::{get_empty_sector_update_params, get_empty_sector_update_verifying_key},
+    api::util::{self, get_aggregate_target_len, pad_inputs_to_target, pad_proofs_to_target},
+    caches::{
+        get_empty_sector_update_params, get_empty_sector_update_verifying_key, get_stacked_srs_key,
+        get_stacked_srs_verifier_key,
+    },
+    chunk_iter::ChunkIterator,
     constants::{DefaultPieceDomain, DefaultPieceHasher},
     pieces::verify_pieces,
     types::{
-        Commitment, EmptySectorUpdateEncoded, EmptySectorUpdateProof, PieceInfo, PoRepConfig,
-        SectorUpdateConfig,
+        AggregateSnarkProof, Commitment, EmptySectorUpdateEncoded, EmptySectorUpdateProof,
+        PieceInfo, PoRepConfig, SectorUpdateConfig, SectorUpdateProofInputs,
     },
 };
-
-// Instantiates p_aux from the specified cache_dir for access to comm_c and comm_r_last
-fn get_p_aux<Tree: 'static + MerkleTreeTrait<Hasher = TreeRHasher>>(
-    cache_path: &Path,
-) -> Result<PersistentAux<<Tree::Hasher as Hasher>::Domain>> {
-    let p_aux_path = cache_path.join(CacheKey::PAux.to_string());
-    let p_aux_bytes = fs::read(&p_aux_path)
-        .with_context(|| format!("could not read file p_aux={:?}", p_aux_path))?;
-
-    let p_aux = deserialize(&p_aux_bytes)?;
-
-    Ok(p_aux)
-}
-
-fn persist_p_aux<Tree: 'static + MerkleTreeTrait<Hasher = TreeRHasher>>(
-    p_aux: &PersistentAux<<Tree::Hasher as Hasher>::Domain>,
-    cache_path: &Path,
-) -> Result<()> {
-    let p_aux_path = cache_path.join(CacheKey::PAux.to_string());
-    let mut f_p_aux = File::create(&p_aux_path)
-        .with_context(|| format!("could not create file p_aux={:?}", p_aux_path))?;
-    let p_aux_bytes = serialize(&p_aux)?;
-    f_p_aux
-        .write_all(&p_aux_bytes)
-        .with_context(|| format!("could not write to file p_aux={:?}", p_aux_path))?;
-
-    Ok(())
-}
-
-// Instantiates t_aux from the specified cache_dir for access to
-// labels and tree_d, tree_c, tree_r_last store configs
-fn get_t_aux<Tree: 'static + MerkleTreeTrait<Hasher = TreeRHasher>>(
-    cache_path: &Path,
-) -> Result<TemporaryAux<Tree, DefaultPieceHasher>> {
-    let t_aux_path = cache_path.join(CacheKey::TAux.to_string());
-    trace!("Instantiating TemporaryAux from {:?}", cache_path);
-    let t_aux_bytes = fs::read(&t_aux_path)
-        .with_context(|| format!("could not read file t_aux={:?}", t_aux_path))?;
-
-    let mut res: TemporaryAux<Tree, DefaultPieceHasher> = deserialize(&t_aux_bytes)?;
-    res.set_cache_path(cache_path);
-    trace!("Set TemporaryAux cache_path to {:?}", cache_path);
-
-    Ok(res)
-}
-
-fn persist_t_aux<Tree: 'static + MerkleTreeTrait<Hasher = TreeRHasher>>(
-    t_aux: &TemporaryAux<Tree, DefaultPieceHasher>,
-    cache_path: &Path,
-) -> Result<()> {
-    let t_aux_path = cache_path.join(CacheKey::TAux.to_string());
-    let mut f_t_aux = File::create(&t_aux_path)
-        .with_context(|| format!("could not create file t_aux={:?}", t_aux_path))?;
-    let t_aux_bytes = serialize(&t_aux)?;
-    f_t_aux
-        .write_all(&t_aux_bytes)
-        .with_context(|| format!("could not write to file t_aux={:?}", t_aux_path))?;
-
-    Ok(())
-}
 
 // Re-instantiate a t_aux with the new cache path, then use the tree_d
 // and tree_r_last configs from it.  This is done to preserve the
@@ -104,32 +59,29 @@ fn persist_t_aux<Tree: 'static + MerkleTreeTrait<Hasher = TreeRHasher>>(
 //
 // Returns a pair of the new tree_d_config and tree_r_last configs
 fn get_new_configs_from_t_aux_old<Tree: 'static + MerkleTreeTrait<Hasher = TreeRHasher>>(
-    t_aux_old: &TemporaryAux<Tree, DefaultPieceHasher>,
+    t_aux: &TemporaryAux<Tree, DefaultPieceHasher>,
     new_cache_path: &Path,
     nodes_count: usize,
 ) -> Result<(StoreConfig, StoreConfig)> {
-    let mut t_aux_new = t_aux_old.clone();
-    t_aux_new.set_cache_path(new_cache_path);
-
     let tree_count = get_base_tree_count::<Tree>();
     let base_tree_nodes_count = nodes_count / tree_count;
 
-    // With the new cache path set, formulate the new tree_d and
-    // tree_r_last configs.
-    let tree_d_new_config = StoreConfig::from_config(
-        &t_aux_new.tree_d_config,
-        CacheKey::CommDTree.to_string(),
-        Some(get_merkle_tree_len(nodes_count, TreeDArity::to_usize())?),
-    );
+    let tree_d_new_config = StoreConfig {
+        path: new_cache_path.into(),
+        id: t_aux.tree_d_config.id.clone(),
+        size: Some(get_merkle_tree_len(nodes_count, TreeDArity::to_usize())?),
+        rows_to_discard: t_aux.tree_d_config.rows_to_discard,
+    };
 
-    let tree_r_last_new_config = StoreConfig::from_config(
-        &t_aux_new.tree_r_last_config,
-        CacheKey::CommRLastTree.to_string(),
-        Some(get_merkle_tree_len(
+    let tree_r_last_new_config = StoreConfig {
+        path: new_cache_path.into(),
+        id: t_aux.tree_r_last_config.id.clone(),
+        size: Some(get_merkle_tree_len(
             base_tree_nodes_count,
             Tree::Arity::to_usize(),
         )?),
-    );
+        rows_to_discard: t_aux.tree_r_last_config.rows_to_discard,
+    };
 
     Ok((tree_d_new_config, tree_r_last_new_config))
 }
@@ -140,7 +92,7 @@ fn get_new_configs_from_t_aux_old<Tree: 'static + MerkleTreeTrait<Hasher = TreeR
 /// new_cache_path).
 #[allow(clippy::too_many_arguments)]
 pub fn encode_into<Tree: 'static + MerkleTreeTrait<Hasher = TreeRHasher>>(
-    porep_config: PoRepConfig,
+    config: &SectorUpdateConfig,
     new_replica_path: &Path,
     new_cache_path: &Path,
     sector_key_path: &Path,
@@ -149,11 +101,18 @@ pub fn encode_into<Tree: 'static + MerkleTreeTrait<Hasher = TreeRHasher>>(
     piece_infos: &[PieceInfo],
 ) -> Result<EmptySectorUpdateEncoded> {
     info!("encode_into:start");
-    let config = SectorUpdateConfig::from_porep_config(porep_config);
 
-    let p_aux = get_p_aux::<Tree>(sector_key_cache_path)?;
-    let t_aux = get_t_aux::<Tree>(sector_key_cache_path)?;
+    ensure!(
+        fs::metadata(sector_key_cache_path)?.is_dir(),
+        "sector_key_cache_path must be a directory",
+    );
+    let p_aux = util::get_p_aux::<Tree>(sector_key_cache_path)?;
+    let t_aux = util::get_t_aux::<Tree>(sector_key_cache_path, u64::from(config.sector_size))?;
 
+    ensure!(
+        fs::metadata(new_cache_path)?.is_dir(),
+        "new_cache_path must be a directory"
+    );
     let (tree_d_new_config, tree_r_last_new_config) =
         get_new_configs_from_t_aux_old::<Tree>(&t_aux, new_cache_path, config.nodes_count)?;
 
@@ -165,11 +124,9 @@ pub fn encode_into<Tree: 'static + MerkleTreeTrait<Hasher = TreeRHasher>>(
             <Tree::Hasher as Hasher>::Domain::try_from_bytes(&p_aux.comm_c.into_bytes())?,
             <Tree::Hasher as Hasher>::Domain::try_from_bytes(&p_aux.comm_r_last.into_bytes())?,
             new_replica_path,
-            new_cache_path,
             sector_key_path,
-            sector_key_cache_path,
             staged_data_path,
-            usize::from(config.h_select),
+            h_default(config.nodes_count),
         )?;
 
     let mut comm_d = [0; 32];
@@ -180,6 +137,10 @@ pub fn encode_into<Tree: 'static + MerkleTreeTrait<Hasher = TreeRHasher>>(
     comm_r_domain.write_bytes(&mut comm_r)?;
     comm_r_last_domain.write_bytes(&mut comm_r_last)?;
 
+    // Note that there's nothing inherently incorrect about zero
+    // commitments, but given that this check exists during the
+    // sealing process and may have historically been hit, this is
+    // considered a consistency check
     ensure!(comm_d != [0; 32], "Invalid all zero commitment (comm_d)");
     ensure!(comm_r != [0; 32], "Invalid all zero commitment (comm_r)");
     ensure!(
@@ -187,15 +148,16 @@ pub fn encode_into<Tree: 'static + MerkleTreeTrait<Hasher = TreeRHasher>>(
         "Invalid all zero commitment (comm_r)"
     );
     ensure!(
-        verify_pieces(&comm_d, piece_infos, porep_config.into())?,
+        verify_pieces(&comm_d, piece_infos, config.sector_size)?,
         "pieces and comm_d do not match"
     );
 
     // Persist p_aux and t_aux into the new_cache_path here
     let mut p_aux = p_aux;
     p_aux.comm_r_last = comm_r_last_domain;
-    persist_p_aux::<Tree>(&p_aux, new_cache_path)?;
-    persist_t_aux::<Tree>(&t_aux, new_cache_path)?;
+    util::persist_p_aux::<Tree>(&p_aux, new_cache_path)?;
+    #[cfg(not(feature = "fixed-rows-to-discard"))]
+    util::persist_t_aux::<Tree>(&t_aux, new_cache_path)?;
 
     info!("encode_into:finish");
 
@@ -204,6 +166,85 @@ pub fn encode_into<Tree: 'static + MerkleTreeTrait<Hasher = TreeRHasher>>(
         comm_r_last_new: comm_r_last,
         comm_d_new: comm_d,
     })
+}
+
+/// Decodes a range of data with the given sector key.
+///
+/// This function is similar to [`decode_from`], the difference is that it operates directly on the
+/// given file descriptions. The current position of the file descriptors is where the decoding
+/// starts, i.e. you need to seek to the intended offset before you call this function. The
+/// `nodes_offset` is the node offset relative to the beginning of the file. This information is
+/// needed in order to do the decoding correctly. The `nodes_count` is the total number of nodes
+/// within the file. The `num_nodes` defines how many nodes will be decoded, starting from the
+/// current position.
+#[allow(clippy::too_many_arguments)]
+pub fn decode_from_range<R: Read, S: Read, W: Write>(
+    nodes_count: usize,
+    comm_d: Commitment,
+    comm_r: Commitment,
+    input_data: R,
+    sector_key_data: S,
+    output_data: &mut W,
+    nodes_offset: usize,
+    num_nodes: usize,
+) -> Result<()> {
+    let comm_d_domain = TreeDDomain::try_from_bytes(&comm_d[..])?;
+    let comm_r_domain = TreeRDomain::try_from_bytes(&comm_r[..])?;
+    let phi = phi(&comm_d_domain, &comm_r_domain);
+    let h = h_default(nodes_count);
+    let rho_invs = Rhos::new_inv_range(&phi, h, nodes_count, nodes_offset, num_nodes);
+
+    let bytes_length = num_nodes * NODE_SIZE;
+
+    let input_iter = ChunkIterator::new(input_data);
+    let sector_key_iter = ChunkIterator::new(sector_key_data);
+    let chunk_size = input_iter.chunk_size();
+
+    for (chunk_index, (input_chunk_result, sector_key_chunk_result)) in
+        input_iter.zip(sector_key_iter).enumerate()
+    {
+        let chunk_offset = chunk_index * chunk_size;
+
+        // The end of the intended decoding range was reached.
+        if chunk_offset > bytes_length {
+            break;
+        }
+
+        let input_chunk = input_chunk_result.context("cannot read input data")?;
+        let sector_key_chunk = sector_key_chunk_result.context("connot read sector key data")?;
+
+        // If the bytes that still need to be read is smaller then the chunk size, then use that
+        // size.
+        let current_chunk_size = cmp::min(bytes_length - chunk_offset, chunk_size);
+        ensure!(
+            current_chunk_size <= input_chunk.len(),
+            "not enough bytes in input",
+        );
+        ensure!(
+            current_chunk_size <= sector_key_chunk.len(),
+            "not enough bytes in sector key",
+        );
+
+        let output_reprs = (0..current_chunk_size)
+            .step_by(NODE_SIZE)
+            .map(|index| {
+                // The absolute byte offset within the current sector
+                let offset = (nodes_offset * NODE_SIZE) + chunk_offset + index;
+                let rho_inv = rho_invs.get(offset / NODE_SIZE);
+
+                let sector_key_fr = bytes_into_fr(&sector_key_chunk[index..index + NODE_SIZE])?;
+                let input_fr = bytes_into_fr(&input_chunk[index..index + NODE_SIZE])?;
+
+                // This is the actual encoding step. Those operations happen on field elements.
+                let output_fr = (input_fr - sector_key_fr) * rho_inv;
+                Ok(output_fr.to_repr())
+            })
+            .collect::<Result<Vec<_>>>()?;
+
+        output_data.write_all(&output_reprs.concat())?;
+    }
+
+    Ok(())
 }
 
 /// Reverses the encoding process and outputs the data into out_data_path.
@@ -218,11 +259,10 @@ pub fn decode_from<Tree: 'static + MerkleTreeTrait<Hasher = TreeRHasher>>(
 ) -> Result<()> {
     info!("decode_from:start");
 
-    let p_aux = get_p_aux::<Tree>(sector_key_cache_path)?;
+    let p_aux = util::get_p_aux::<Tree>(sector_key_cache_path)?;
 
-    let nodes_count = config.nodes_count;
     EmptySectorUpdate::<Tree>::decode_from(
-        nodes_count,
+        config.nodes_count,
         out_data_path,
         replica_path,
         sector_key_path,
@@ -230,7 +270,7 @@ pub fn decode_from<Tree: 'static + MerkleTreeTrait<Hasher = TreeRHasher>>(
         <Tree::Hasher as Hasher>::Domain::try_from_bytes(&p_aux.comm_c.into_bytes())?,
         comm_d_new.into(),
         <Tree::Hasher as Hasher>::Domain::try_from_bytes(&p_aux.comm_r_last.into_bytes())?,
-        usize::from(config.h_select),
+        h_default(config.nodes_count),
     )?;
 
     info!("decode_from:finish");
@@ -250,15 +290,14 @@ pub fn remove_encoded_data<Tree: 'static + MerkleTreeTrait<Hasher = TreeRHasher>
 ) -> Result<()> {
     info!("remove_data:start");
 
-    let p_aux = get_p_aux::<Tree>(replica_cache_path)?;
-    let t_aux = get_t_aux::<Tree>(replica_cache_path)?;
+    let p_aux = util::get_p_aux::<Tree>(replica_cache_path)?;
+    let t_aux = util::get_t_aux::<Tree>(replica_cache_path, u64::from(config.sector_size))?;
 
     let (_, tree_r_last_new_config) =
         get_new_configs_from_t_aux_old::<Tree>(&t_aux, sector_key_cache_path, config.nodes_count)?;
 
-    let nodes_count = config.nodes_count;
     let tree_r_last_new = EmptySectorUpdate::<Tree>::remove_encoded_data(
-        nodes_count,
+        config.nodes_count,
         sector_key_path,
         sector_key_cache_path,
         replica_path,
@@ -268,14 +307,15 @@ pub fn remove_encoded_data<Tree: 'static + MerkleTreeTrait<Hasher = TreeRHasher>
         <Tree::Hasher as Hasher>::Domain::try_from_bytes(&p_aux.comm_c.into_bytes())?,
         comm_d_new.into(),
         <Tree::Hasher as Hasher>::Domain::try_from_bytes(&p_aux.comm_r_last.into_bytes())?,
-        usize::from(config.h_select),
+        h_default(config.nodes_count),
     )?;
 
     // Persist p_aux and t_aux into the sector_key_cache_path here
     let mut p_aux = p_aux;
     p_aux.comm_r_last = tree_r_last_new;
-    persist_p_aux::<Tree>(&p_aux, sector_key_cache_path)?;
-    persist_t_aux::<Tree>(&t_aux, sector_key_cache_path)?;
+    util::persist_p_aux::<Tree>(&p_aux, sector_key_cache_path)?;
+    #[cfg(not(feature = "fixed-rows-to-discard"))]
+    util::persist_t_aux::<Tree>(&t_aux, sector_key_cache_path)?;
 
     info!("remove_data:finish");
     Ok(())
@@ -304,7 +344,7 @@ pub fn generate_single_partition_proof<Tree: 'static + MerkleTreeTrait<Hasher = 
     let public_params: storage_proofs_update::PublicParams =
         PublicParams::from_sector_size(u64::from(config.sector_size));
 
-    let p_aux_old = get_p_aux::<Tree>(sector_key_cache_path)?;
+    let p_aux_old = util::get_p_aux::<Tree>(sector_key_cache_path)?;
 
     let partitions = usize::from(config.update_partitions);
     ensure!(partition_index < partitions, "invalid partition index");
@@ -314,10 +354,10 @@ pub fn generate_single_partition_proof<Tree: 'static + MerkleTreeTrait<Hasher = 
         comm_r_old: comm_r_old_safe,
         comm_d_new: comm_d_new_safe,
         comm_r_new: comm_r_new_safe,
-        h: usize::from(config.h_select),
+        h: config.h,
     };
 
-    let t_aux_old = get_t_aux::<Tree>(sector_key_cache_path)?;
+    let t_aux_old = util::get_t_aux::<Tree>(sector_key_cache_path, u64::from(config.sector_size))?;
 
     let (tree_d_new_config, tree_r_last_new_config) =
         get_new_configs_from_t_aux_old::<Tree>(&t_aux_old, replica_cache_path, config.nodes_count)?;
@@ -367,7 +407,7 @@ pub fn verify_single_partition_proof<Tree: 'static + MerkleTreeTrait<Hasher = Tr
         comm_r_old: comm_r_old_safe,
         comm_d_new: comm_d_new_safe,
         comm_r_new: comm_r_new_safe,
-        h: usize::from(config.h_select),
+        h: config.h,
     };
 
     let valid = EmptySectorUpdate::<Tree>::verify(&public_params, &public_inputs, &proof)?;
@@ -399,17 +439,17 @@ pub fn generate_partition_proofs<Tree: 'static + MerkleTreeTrait<Hasher = TreeRH
     let public_params: storage_proofs_update::PublicParams =
         PublicParams::from_sector_size(u64::from(config.sector_size));
 
-    let p_aux_old = get_p_aux::<Tree>(sector_key_cache_path)?;
+    let p_aux_old = util::get_p_aux::<Tree>(sector_key_cache_path)?;
 
     let public_inputs: storage_proofs_update::PublicInputs = PublicInputs {
         k: usize::from(config.update_partitions),
         comm_r_old: comm_r_old_safe,
         comm_d_new: comm_d_new_safe,
         comm_r_new: comm_r_new_safe,
-        h: usize::from(config.h_select),
+        h: config.h,
     };
 
-    let t_aux_old = get_t_aux::<Tree>(sector_key_cache_path)?;
+    let t_aux_old = util::get_t_aux::<Tree>(sector_key_cache_path, u64::from(config.sector_size))?;
 
     let (tree_d_new_config, tree_r_last_new_config) =
         get_new_configs_from_t_aux_old::<Tree>(&t_aux_old, replica_cache_path, config.nodes_count)?;
@@ -458,7 +498,7 @@ pub fn verify_partition_proofs<Tree: 'static + MerkleTreeTrait<Hasher = TreeRHas
         comm_r_old: comm_r_old_safe,
         comm_d_new: comm_d_new_safe,
         comm_r_new: comm_r_new_safe,
-        h: usize::from(config.h_select),
+        h: config.h,
     };
 
     let valid =
@@ -473,7 +513,7 @@ pub fn verify_partition_proofs<Tree: 'static + MerkleTreeTrait<Hasher = TreeRHas
 pub fn generate_empty_sector_update_proof_with_vanilla<
     Tree: 'static + MerkleTreeTrait<Hasher = TreeRHasher>,
 >(
-    porep_config: PoRepConfig,
+    porep_config: &PoRepConfig,
     vanilla_proofs: Vec<PartitionProof<Tree>>,
     comm_r_old: Commitment,
     comm_r_new: Commitment,
@@ -494,7 +534,7 @@ pub fn generate_empty_sector_update_proof_with_vanilla<
         comm_r_old: comm_r_old_safe,
         comm_d_new: comm_d_new_safe,
         comm_r_new: comm_r_new_safe,
-        h: usize::from(config.h_select),
+        h: config.h,
     };
 
     let setup_params_compound = compound_proof::SetupParams {
@@ -507,7 +547,7 @@ pub fn generate_empty_sector_update_proof_with_vanilla<
     let pub_params_compound = EmptySectorUpdateCompound::<Tree>::setup(&setup_params_compound)?;
 
     let groth_params = get_empty_sector_update_params::<Tree>(porep_config)?;
-    let multi_proof = EmptySectorUpdateCompound::prove_with_vanilla(
+    let proofs = EmptySectorUpdateCompound::prove_with_vanilla(
         &pub_params_compound,
         &public_inputs,
         vanilla_proofs,
@@ -516,12 +556,13 @@ pub fn generate_empty_sector_update_proof_with_vanilla<
 
     info!("generate_empty_sector_update_proof_with_vanilla:finish");
 
-    Ok(EmptySectorUpdateProof(multi_proof.to_vec()?))
+    let proofs_bytes = util::proofs_to_bytes(&proofs)?;
+    Ok(EmptySectorUpdateProof(proofs_bytes))
 }
 
 #[allow(clippy::too_many_arguments)]
 pub fn generate_empty_sector_update_proof<Tree: 'static + MerkleTreeTrait<Hasher = TreeRHasher>>(
-    porep_config: PoRepConfig,
+    porep_config: &PoRepConfig,
     comm_r_old: Commitment,
     comm_r_new: Commitment,
     comm_d_new: Commitment,
@@ -539,7 +580,7 @@ pub fn generate_empty_sector_update_proof<Tree: 'static + MerkleTreeTrait<Hasher
 
     let config = SectorUpdateConfig::from_porep_config(porep_config);
 
-    let p_aux_old = get_p_aux::<Tree>(sector_key_cache_path)?;
+    let p_aux_old = util::get_p_aux::<Tree>(sector_key_cache_path)?;
 
     let partitions = usize::from(config.update_partitions);
     let public_inputs: storage_proofs_update::PublicInputs = PublicInputs {
@@ -547,10 +588,10 @@ pub fn generate_empty_sector_update_proof<Tree: 'static + MerkleTreeTrait<Hasher
         comm_r_old: comm_r_old_safe,
         comm_d_new: comm_d_new_safe,
         comm_r_new: comm_r_new_safe,
-        h: usize::from(config.h_select),
+        h: config.h,
     };
 
-    let t_aux_old = get_t_aux::<Tree>(sector_key_cache_path)?;
+    let t_aux_old = util::get_t_aux::<Tree>(sector_key_cache_path, u64::from(config.sector_size))?;
 
     let (tree_d_new_config, tree_r_last_new_config) =
         get_new_configs_from_t_aux_old::<Tree>(&t_aux_old, replica_cache_path, config.nodes_count)?;
@@ -574,7 +615,7 @@ pub fn generate_empty_sector_update_proof<Tree: 'static + MerkleTreeTrait<Hasher
     let pub_params_compound = EmptySectorUpdateCompound::<Tree>::setup(&setup_params_compound)?;
 
     let groth_params = get_empty_sector_update_params::<Tree>(porep_config)?;
-    let multi_proof = EmptySectorUpdateCompound::prove(
+    let proofs = EmptySectorUpdateCompound::prove(
         &pub_params_compound,
         &public_inputs,
         &private_inputs,
@@ -583,11 +624,12 @@ pub fn generate_empty_sector_update_proof<Tree: 'static + MerkleTreeTrait<Hasher
 
     info!("generate_empty_sector_update_proof:finish");
 
-    Ok(EmptySectorUpdateProof(multi_proof.to_vec()?))
+    let proofs_bytes = util::proofs_to_bytes(&proofs)?;
+    Ok(EmptySectorUpdateProof(proofs_bytes))
 }
 
 pub fn verify_empty_sector_update_proof<Tree: 'static + MerkleTreeTrait<Hasher = TreeRHasher>>(
-    porep_config: PoRepConfig,
+    porep_config: &PoRepConfig,
     proof_bytes: &[u8],
     comm_r_old: Commitment,
     comm_r_new: Commitment,
@@ -607,7 +649,7 @@ pub fn verify_empty_sector_update_proof<Tree: 'static + MerkleTreeTrait<Hasher =
         comm_r_old: comm_r_old_safe,
         comm_d_new: comm_d_new_safe,
         comm_r_new: comm_r_new_safe,
-        h: usize::from(config.h_select),
+        h: config.h,
     };
     let setup_params_compound = compound_proof::SetupParams {
         vanilla_params: SetupParams {
@@ -626,4 +668,289 @@ pub fn verify_empty_sector_update_proof<Tree: 'static + MerkleTreeTrait<Hasher =
     info!("verify_empty_sector_update_proof:finish");
 
     Ok(valid)
+}
+
+/// Given the specified arguments, this method returns the inputs that were used to
+/// generate the sector update proof.  This can be useful for proof aggregation, as verification
+/// requires these inputs.
+///
+/// This method allows them to be retrieved when needed, rather than storing them for
+/// some amount of time.
+///
+/// # Arguments
+///
+/// * `porep_config` - this sector's porep config that contains the number of bytes in the sector.
+/// * `comm_r_old` - a commitment to a sector's previous replica.
+/// * `comm_r_new` - a commitment to a sector's current replica.
+/// * `comm_d_new` - a commitment to a sector's current data.
+pub fn get_sector_update_inputs<Tree: 'static + MerkleTreeTrait<Hasher = TreeRHasher>>(
+    porep_config: &PoRepConfig,
+    comm_r_old: Commitment,
+    comm_r_new: Commitment,
+    comm_d_new: Commitment,
+) -> Result<Vec<Vec<Fr>>> {
+    trace!("get_sector_update_inputs:start");
+
+    // Note that there's nothing inherently incorrect about zero
+    // commitments, but given that this check exists during the
+    // sealing process and may have historically been hit, this is
+    // considered a consistency check
+    ensure!(
+        comm_r_old != [0; 32],
+        "Invalid all zero commitment (comm_r_old)"
+    );
+    ensure!(
+        comm_r_new != [0; 32],
+        "Invalid all zero commitment (comm_r_new)"
+    );
+    ensure!(
+        comm_d_new != [0; 32],
+        "Invalid all zero commitment (comm_d_new)"
+    );
+
+    let comm_r_old_safe = <TreeRHasher as Hasher>::Domain::try_from_bytes(&comm_r_old)?;
+    let comm_r_new_safe = <TreeRHasher as Hasher>::Domain::try_from_bytes(&comm_r_new)?;
+
+    let comm_d_new_safe = DefaultPieceDomain::try_from_bytes(&comm_d_new)?;
+
+    let config = SectorUpdateConfig::from_porep_config(porep_config);
+    let partitions = usize::from(config.update_partitions);
+
+    let public_inputs: storage_proofs_update::PublicInputs = PublicInputs {
+        k: 0,
+        comm_r_old: comm_r_old_safe,
+        comm_d_new: comm_d_new_safe,
+        comm_r_new: comm_r_new_safe,
+        h: config.h,
+    };
+    let setup_params_compound = compound_proof::SetupParams {
+        vanilla_params: SetupParams {
+            sector_bytes: u64::from(config.sector_size),
+        },
+        partitions: Some(partitions),
+        priority: false,
+    };
+    let pub_params_compound = EmptySectorUpdateCompound::<Tree>::setup(&setup_params_compound)?;
+
+    // These are returned for aggregated proof verification.
+    let inputs: Vec<_> = (0..partitions)
+        .into_par_iter()
+        .map(|k| {
+            EmptySectorUpdateCompound::<Tree>::generate_public_inputs(
+                &public_inputs,
+                &pub_params_compound.vanilla_params,
+                Some(k),
+            )
+        })
+        .collect::<Result<_>>()?;
+
+    trace!("get_sector_update_inputs:finish");
+
+    Ok(inputs)
+}
+
+// Hash all of the commitments into an ordered digest for the aggregate proof method.
+fn get_hashed_commitments(sector_update_inputs: &[SectorUpdateProofInputs]) -> [u8; 32] {
+    let hashed_commitments: [u8; 32] = {
+        let mut hasher = Sha256::new();
+        for input in sector_update_inputs.iter() {
+            hasher.update([input.h as u8]);
+            hasher.update(input.comm_r_old);
+            hasher.update(input.comm_r_new);
+            hasher.update(input.comm_d_new);
+        }
+        hasher.finalize().into()
+    };
+
+    hashed_commitments
+}
+
+pub fn aggregate_empty_sector_update_proofs<
+    Tree: 'static + MerkleTreeTrait<Hasher = TreeRHasher>,
+>(
+    porep_config: &PoRepConfig,
+    proofs: &[EmptySectorUpdateProof],
+    sector_update_inputs: &[SectorUpdateProofInputs],
+    aggregate_version: groth16::aggregate::AggregateVersion,
+) -> Result<AggregateSnarkProof> {
+    info!("aggregate_empty_sector_update_proofs:start");
+
+    info!(
+        "aggregate_empty_sector_update_proofs using API Version {}",
+        porep_config.api_version
+    );
+    ensure!(
+        porep_config.api_version >= ApiVersion::V1_2_0,
+        "Empty Sector Update proof aggregation is supported in ApiVersion 1.2.0 or later"
+    );
+    ensure!(
+        aggregate_version == groth16::aggregate::AggregateVersion::V2,
+        "Empty sector update aggregation requires SnarkPackV2"
+    );
+    ensure!(
+        !sector_update_inputs.is_empty(),
+        "cannot aggregate with empty sector_update_inputs"
+    );
+
+    let h = sector_update_inputs[0].h;
+    for sector_update_input in sector_update_inputs {
+        ensure!(
+            h == sector_update_input.h,
+            "mismatched h values in sector update aggregation inputs!"
+        );
+    }
+    let config = SectorUpdateConfig::from_porep_config(porep_config);
+    let partitions = usize::from(config.update_partitions);
+
+    let mut proofs: Vec<_> = proofs
+        .iter()
+        .try_fold(Vec::new(), |mut acc, proof| -> Result<_> {
+            acc.extend(groth16::Proof::read_many(proof.0.as_slice(), partitions)?);
+
+            Ok(acc)
+        })?;
+    trace!(
+        "aggregate_sector_update_proofs called with {} inputs for {} proofs",
+        sector_update_inputs.len(),
+        proofs.len(),
+    );
+
+    // Note that the proofs count here is not the same as the input
+    // proofs since the multi proof type takes the partitions into
+    // account
+    let target_proofs_len = get_aggregate_target_len(proofs.len());
+    ensure!(
+        target_proofs_len > 1,
+        "cannot aggregate less than two proofs"
+    );
+    trace!(
+        "aggregate_sector_update_proofs will pad proofs to target_len {}",
+        target_proofs_len
+    );
+
+    // If we're not at the pow2 target, duplicate the last proof until we are.
+    pad_proofs_to_target(&mut proofs, target_proofs_len)?;
+
+    let hashed_commitments = get_hashed_commitments(sector_update_inputs);
+    let srs_prover_key = get_stacked_srs_key::<Tree>(porep_config, proofs.len())?;
+    let aggregate_proof = EmptySectorUpdateCompound::<Tree>::aggregate_proofs(
+        &srs_prover_key,
+        &hashed_commitments,
+        proofs.as_slice(),
+        aggregate_version,
+    )?;
+    let mut aggregate_proof_bytes = Vec::new();
+    aggregate_proof.write(&mut aggregate_proof_bytes)?;
+
+    info!("aggregate_empty_sector_update_proofs:finish");
+
+    Ok(aggregate_proof_bytes)
+}
+
+pub fn verify_aggregate_sector_update_proofs<
+    Tree: 'static + MerkleTreeTrait<Hasher = TreeRHasher>,
+>(
+    porep_config: &PoRepConfig,
+    aggregate_proof_bytes: AggregateSnarkProof,
+    inputs: &[SectorUpdateProofInputs],
+    sector_update_inputs: Vec<Vec<Fr>>,
+    aggregate_version: groth16::aggregate::AggregateVersion,
+) -> Result<bool> {
+    info!("verify_aggregate_sector_update_proofs:start");
+
+    info!(
+        "verify_aggregate_sector_update_proofs using API Version {}",
+        porep_config.api_version
+    );
+    ensure!(
+        porep_config.api_version >= ApiVersion::V1_2_0,
+        "Empty Sector Update proof aggregation is supported in ApiVersion 1.2.0 or later"
+    );
+    ensure!(
+        aggregate_version == groth16::aggregate::AggregateVersion::V2,
+        "Empty sector update aggregate verification requires SnarkPackV2"
+    );
+
+    let aggregate_proof =
+        groth16::aggregate::AggregateProof::read(std::io::Cursor::new(&aggregate_proof_bytes))?;
+
+    let aggregated_proofs_len = aggregate_proof.tmipp.gipa.nproofs as usize;
+
+    ensure!(aggregated_proofs_len != 0, "cannot verify zero proofs");
+    ensure!(
+        !sector_update_inputs.is_empty(),
+        "cannot verify with empty inputs"
+    );
+    ensure!(
+        !inputs.is_empty(),
+        "cannot verify with empty sector_update_inputs"
+    );
+    let h = inputs[0].h;
+    for input in inputs {
+        ensure!(
+            h == input.h,
+            "mismatched h values in sector update verify aggregation inputs!"
+        );
+    }
+
+    trace!(
+        "verify_aggregate_sector_update_proofs called with len {}",
+        aggregated_proofs_len,
+    );
+
+    ensure!(
+        aggregated_proofs_len > 1,
+        "cannot verify less than two proofs"
+    );
+    ensure!(
+        aggregated_proofs_len == aggregated_proofs_len.next_power_of_two(),
+        "cannot verify non-pow2 aggregate seal proofs"
+    );
+
+    let num_inputs = sector_update_inputs.len();
+
+    // Note that 'num_inputs_per_proof' should always be exactly 1 --
+    // each vector in 'sector_update_inputs' are the public inputs to
+    // one Groth16 proof
+    let num_inputs_per_proof = get_aggregate_target_len(num_inputs) / aggregated_proofs_len;
+    ensure!(num_inputs_per_proof == 1, "num_inputs per proof mismatch");
+    let target_inputs_len = aggregated_proofs_len * num_inputs_per_proof;
+
+    trace!(
+        "verify_aggregate_sector_update_proofs got {} combined inputs with {} inputs per proof, target_len is {}",
+        num_inputs,
+        num_inputs_per_proof,
+        target_inputs_len,
+    );
+
+    ensure!(
+        target_inputs_len % aggregated_proofs_len == 0,
+        "invalid number of inputs provided",
+    );
+
+    let sector_update_inputs = pad_inputs_to_target(
+        &sector_update_inputs,
+        num_inputs_per_proof,
+        target_inputs_len,
+    )?;
+
+    let hashed_commitments = get_hashed_commitments(inputs);
+    let verifying_key = get_empty_sector_update_verifying_key::<Tree>(porep_config)?;
+    let srs_verifier_key =
+        get_stacked_srs_verifier_key::<Tree>(porep_config, aggregated_proofs_len)?;
+
+    trace!("start verifying aggregate sector update proof");
+    let result = EmptySectorUpdateCompound::<Tree>::verify_aggregate_proofs(
+        &srs_verifier_key,
+        &verifying_key,
+        &hashed_commitments,
+        sector_update_inputs.as_slice(),
+        &aggregate_proof,
+        aggregate_version,
+    )?;
+    trace!("end verifying aggregate sector update proof");
+
+    info!("verify_aggregate_sector_update_proofs:finish");
+
+    Ok(result)
 }

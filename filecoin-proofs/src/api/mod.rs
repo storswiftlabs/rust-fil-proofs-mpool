@@ -1,13 +1,13 @@
-use std::fs::{self, File, OpenOptions};
+use std::collections::BTreeMap;
+use std::fs::{File, OpenOptions};
 use std::io::{self, BufReader, BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
 
 use anyhow::{ensure, Context, Result};
-use bincode::deserialize;
 use filecoin_hashers::Hasher;
 use fr32::{write_unpadded, Fr32Reader};
 use log::{info, trace};
-use memmap::MmapOptions;
+use memmap2::MmapOptions;
 use merkletree::store::{DiskStore, LevelCacheStore, StoreConfig};
 use storage_proofs_core::{
     cache_key::CacheKey,
@@ -15,13 +15,8 @@ use storage_proofs_core::{
     merkle::get_base_tree_count,
     pieces::generate_piece_commitment_bytes_from_source,
     sector::SectorId,
-    util::default_rows_to_discard,
 };
-use storage_proofs_porep::{
-    stacked::{generate_replica_id, PersistentAux, StackedDrg, TemporaryAux},
-    PoRep,
-};
-pub use storage_proofs_update::constants::TreeRHasher;
+use storage_proofs_porep::stacked::{self, generate_replica_id, PublicParams, StackedDrg};
 use typenum::Unsigned;
 
 use crate::{
@@ -33,9 +28,8 @@ use crate::{
     parameters::public_params,
     pieces::{get_piece_alignment, sum_piece_bytes_with_alignment},
     types::{
-        Commitment, MerkleTreeTrait, PaddedBytesAmount, PieceInfo, PoRepConfig,
-        PoRepProofPartitions, ProverId, SealPreCommitPhase1Output, Ticket, UnpaddedByteIndex,
-        UnpaddedBytesAmount,
+        Commitment, MerkleTreeTrait, PaddedBytesAmount, PieceInfo, PoRepConfig, PrivateReplicaInfo,
+        ProverId, SealPreCommitPhase1Output, Ticket, UnpaddedByteIndex, UnpaddedBytesAmount,
     },
 };
 
@@ -55,7 +49,63 @@ pub use util::*;
 pub use window_post::*;
 pub use winning_post::*;
 
-pub use storage_proofs_update::constants::{hs, partition_count};
+pub use storage_proofs_update::constants::{partition_count, TreeRHasher};
+
+// TODO vmx 2023-09-26: The `Tree` generic is not needed, it's only there in order to not breaking
+// the public API. Once we break the API, remove that generic.
+// Ensure that any associated cached data persisted is discarded.
+pub fn clear_cache<Tree>(cache_dir: &Path) -> Result<()> {
+    info!("clear_cache:start");
+
+    let result = stacked::clear_cache_dir(cache_dir);
+
+    info!("clear_cache:finish");
+
+    result
+}
+
+// TODO vmx 2023-09-26: The `Tree` generic is not needed, it's only there in order to not breaking
+// the public API. Once we break the API, remove that generic.
+// Ensure that any associated cached data persisted is discarded.
+pub fn clear_caches<Tree: MerkleTreeTrait>(
+    replicas: &BTreeMap<SectorId, PrivateReplicaInfo<Tree>>,
+) -> Result<()> {
+    info!("clear_caches:start");
+
+    for replica in replicas.values() {
+        clear_cache::<Tree>(replica.cache_dir.as_path())?;
+    }
+
+    info!("clear_caches:finish");
+
+    Ok(())
+}
+
+// TODO vmx 2023-09-26: The `Tree` generic is not needed, it's only there in order to not breaking
+// the public API. Once we break the API, remove that generic.
+// Ensure that any persisted layer data generated from porep are discarded.
+pub fn clear_layer_data<Tree>(cache_dir: &Path) -> Result<()> {
+    info!("clear_layer_data:start");
+
+    let result = stacked::clear_cache_dir(cache_dir);
+
+    info!("clear_layer_data:finish");
+
+    result
+}
+
+// TODO vmx 2023-09-26: The `Tree` generic is not needed, it's only there in order to not breaking
+// the public API. Once we break the API, remove that generic.
+// Ensure that any persisted vanilla proofs generated from synthetic porep are discarded.
+pub fn clear_synthetic_proofs<Tree>(cache_dir: &Path) -> Result<()> {
+    info!("clear_synthetic_proofs:start");
+
+    let result = stacked::clear_synthetic_proofs(cache_dir);
+
+    info!("clear_synthetic_proofs:finish");
+
+    result
+}
 
 /// Unseals the sector at `sealed_path` and returns the bytes for a piece
 /// whose first (unpadded) byte begins at `offset` and ends at `offset` plus
@@ -76,7 +126,7 @@ pub use storage_proofs_update::constants::{hs, partition_count};
 /// * `num_bytes` - the number of bytes that we want to read.
 #[allow(clippy::too_many_arguments)]
 pub fn get_unsealed_range<T: Into<PathBuf> + AsRef<Path>, Tree: 'static + MerkleTreeTrait>(
-    porep_config: PoRepConfig,
+    porep_config: &PoRepConfig,
     cache_path: T,
     sealed_path: T,
     output_path: T,
@@ -130,7 +180,7 @@ pub fn get_unsealed_range<T: Into<PathBuf> + AsRef<Path>, Tree: 'static + Merkle
 /// * `num_bytes` - the number of bytes that we want to read.
 #[allow(clippy::too_many_arguments)]
 pub fn unseal_range<P, R, W, Tree>(
-    porep_config: PoRepConfig,
+    porep_config: &PoRepConfig,
     cache_path: P,
     mut sealed_sector: R,
     unsealed_output: W,
@@ -198,7 +248,7 @@ where
 /// * `num_bytes` - the number of bytes that we want to read.
 #[allow(clippy::too_many_arguments)]
 pub fn unseal_range_mapped<P, W, Tree>(
-    porep_config: PoRepConfig,
+    porep_config: &PoRepConfig,
     cache_path: P,
     sealed_path: PathBuf,
     unsealed_output: W,
@@ -231,7 +281,7 @@ where
     let mapped_file = OpenOptions::new()
         .read(true)
         .write(true)
-        .open(&sealed_path)?;
+        .open(sealed_path)?;
     let mut data = unsafe { MmapOptions::new().map_copy(&mapped_file)? };
 
     let result = unseal_range_inner::<_, _, Tree>(
@@ -267,7 +317,7 @@ where
 /// * `num_bytes` - the number of bytes that we want to read.
 #[allow(clippy::too_many_arguments)]
 fn unseal_range_inner<P, W, Tree>(
-    porep_config: PoRepConfig,
+    porep_config: &PoRepConfig,
     cache_path: P,
     data: &mut [u8],
     mut unsealed_output: W,
@@ -282,27 +332,19 @@ where
 {
     trace!("unseal_range_inner:start");
 
-    let base_tree_size = get_base_tree_size::<DefaultBinaryTree>(porep_config.sector_size)?;
-    let base_tree_leafs = get_base_tree_leafs::<DefaultBinaryTree>(base_tree_size)?;
-    let config = StoreConfig::new(
-        cache_path.as_ref(),
-        CacheKey::CommDTree.to_string(),
-        default_rows_to_discard(
-            base_tree_leafs,
-            <DefaultBinaryTree as MerkleTreeTrait>::Arity::to_usize(),
-        ),
-    );
-    let pp = public_params(
-        PaddedBytesAmount::from(porep_config),
-        usize::from(PoRepProofPartitions::from(porep_config)),
-        porep_config.porep_id,
-        porep_config.api_version,
-    )?;
+    let config = StoreConfig::new(cache_path.as_ref(), CacheKey::CommDTree.to_string(), 0);
+    let pp: PublicParams<Tree> = public_params(porep_config)?;
 
     let offset_padded: PaddedBytesAmount = UnpaddedBytesAmount::from(offset).into();
     let num_bytes_padded: PaddedBytesAmount = num_bytes.into();
 
-    StackedDrg::<Tree, DefaultPieceHasher>::extract_all(&pp, &replica_id, data, Some(config))?;
+    StackedDrg::<Tree, DefaultPieceHasher>::extract_and_invert_transform_layers(
+        &pp.graph,
+        pp.num_layers,
+        &replica_id,
+        data,
+        config,
+    )?;
     let start: usize = offset_padded.into();
     let end = start + usize::from(num_bytes_padded);
     let unsealed = &data[start..end];
@@ -403,7 +445,7 @@ where
             .context("failed to write and preprocess bytes")?;
 
         ensure!(n != 0, "add_piece: read 0 bytes before EOF from source");
-        let n = PaddedBytesAmount(n as u64);
+        let n = PaddedBytesAmount(n);
         let n: UnpaddedBytesAmount = n.into();
 
         ensure!(n == piece_size, "add_piece: invalid bytes amount written");
@@ -694,25 +736,9 @@ where
     let cache = &cache_path.as_ref();
 
     // Make sure p_aux exists and is valid.
-    let p_aux_path = cache.join(CacheKey::PAux.to_string());
-    let p_aux_bytes = fs::read(&p_aux_path)
-        .with_context(|| format!("could not read file p_aux={:?}", p_aux_path))?;
+    let _ = util::get_p_aux::<Tree>(cache)?;
 
-    let _: PersistentAux<<Tree::Hasher as Hasher>::Domain> = deserialize(&p_aux_bytes)?;
-    drop(p_aux_bytes);
-
-    // Make sure t_aux exists and is valid.
-    let t_aux = {
-        let t_aux_path = cache.join(CacheKey::TAux.to_string());
-        let t_aux_bytes = fs::read(&t_aux_path)
-            .with_context(|| format!("could not read file t_aux={:?}", t_aux_path))?;
-
-        let mut res: TemporaryAux<Tree, DefaultPieceHasher> = deserialize(&t_aux_bytes)?;
-
-        // Switch t_aux to the passed in cache_path
-        res.set_cache_path(&cache_path);
-        res
-    };
+    let t_aux = util::get_t_aux::<Tree>(cache, metadata.len())?;
 
     // Verify all stores/labels within the Labels object.
     let cache = cache_path.as_ref().to_path_buf();

@@ -5,10 +5,9 @@ use blstrs::Scalar as Fr;
 use dialoguer::{theme::ColorfulTheme, MultiSelect};
 use filecoin_proofs::{
     parameters::{public_params, window_post_public_params, winning_post_public_params},
-    with_shape, DefaultPieceHasher, PaddedBytesAmount, PoRepConfig, PoRepProofPartitions,
-    PoStConfig, PoStType, SectorSize, POREP_PARTITIONS, PUBLISHED_SECTOR_SIZES,
-    WINDOW_POST_CHALLENGE_COUNT, WINDOW_POST_SECTOR_COUNT, WINNING_POST_CHALLENGE_COUNT,
-    WINNING_POST_SECTOR_COUNT,
+    with_shape, DefaultPieceHasher, PoRepConfig, PoRepProofPartitions, PoStConfig, PoStType,
+    SectorSize, POREP_PARTITIONS, SUPPORTED_SECTOR_SIZES, WINDOW_POST_CHALLENGE_COUNT,
+    WINDOW_POST_SECTOR_COUNT, WINNING_POST_CHALLENGE_COUNT, WINNING_POST_SECTOR_COUNT,
 };
 use humansize::{file_size_opts, FileSize};
 use log::{info, warn};
@@ -39,13 +38,8 @@ fn circuit_info<C: Circuit<Fr>>(circuit: C) -> CircuitInfo {
 fn get_porep_info<Tree: 'static + MerkleTreeTrait>(porep_config: PoRepConfig) -> CircuitInfo {
     info!("PoRep info");
 
-    let public_params = public_params(
-        PaddedBytesAmount::from(porep_config),
-        usize::from(PoRepProofPartitions::from(porep_config)),
-        porep_config.porep_id,
-        porep_config.api_version,
-    )
-    .expect("failed to get public params from config");
+    let public_params =
+        public_params(&porep_config).expect("failed to get public params from config");
 
     let circuit = <StackedCompound<Tree, DefaultPieceHasher> as CompoundProof<
         StackedDrg<Tree, DefaultPieceHasher>,
@@ -143,12 +137,7 @@ fn porep_info(sector_size: u64, api_version: ApiVersion) -> (CircuitInfo, usize)
     let info = with_shape!(
         sector_size,
         get_porep_info,
-        PoRepConfig {
-            sector_size: SectorSize(sector_size),
-            partitions,
-            porep_id: [0; 32],
-            api_version,
-        }
+        PoRepConfig::new_groth16(sector_size, [0; 32], api_version)
     );
     (info, partitions.into())
 }
@@ -164,7 +153,7 @@ pub fn main() {
 
     // Display interactive menu if no sizes are given
     let sizes: Vec<u64> = if opts.constraints_for_sector_sizes.is_empty() {
-        let sector_sizes = PUBLISHED_SECTOR_SIZES
+        let sector_sizes = SUPPORTED_SECTOR_SIZES
             .iter()
             .map(|sector_size| {
                 // Right aligning the numbers makes them easier to read
@@ -184,7 +173,7 @@ pub fn main() {
             .expect("interaction failed");
 
         // Extract the selected sizes
-        PUBLISHED_SECTOR_SIZES
+        SUPPORTED_SECTOR_SIZES
             .iter()
             .enumerate()
             .filter_map(|(index, size)| {
@@ -199,7 +188,7 @@ pub fn main() {
         opts.constraints_for_sector_sizes
             .into_iter()
             .filter(|size| {
-                if PUBLISHED_SECTOR_SIZES.contains(size) {
+                if SUPPORTED_SECTOR_SIZES.contains(size) {
                     return true;
                 }
 

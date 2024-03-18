@@ -221,7 +221,7 @@ impl<Tree: 'static + MerkleTreeTrait> FallbackPoStCircuit<Tree> {
             .par_chunks(chunk_size)
             .map(|sector_group| {
                 let mut cs = CS::new();
-                cs.alloc_input(|| "temp ONE", || Ok(Fr::one()))?;
+                cs.alloc_input(|| "temp ONE", || Ok(Fr::ONE))?;
 
                 for (i, sector) in sector_group.iter().enumerate() {
                     let mut cs = cs.namespace(|| format!("sector_{}", i));
@@ -233,7 +233,7 @@ impl<Tree: 'static + MerkleTreeTrait> FallbackPoStCircuit<Tree> {
             .collect::<Result<Vec<_>, SynthesisError>>()?;
 
         for sector_cs in css.into_iter() {
-            cs.extend(sector_cs);
+            cs.extend(&sector_cs);
         }
 
         Ok(())

@@ -1,31 +1,32 @@
 use std::collections::BTreeMap;
-use std::fs::{create_dir, read, read_to_string, remove_dir_all, File, OpenOptions};
-use std::io::{stdout, Seek, SeekFrom, Write};
+use std::fs::{create_dir_all, read, read_to_string, remove_dir_all, File, OpenOptions};
+use std::io::{stdout, Seek, Write};
 use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{ensure, Context};
 use bincode::{deserialize, serialize};
 use fil_proofs_tooling::measure::FuncMeasurement;
-use fil_proofs_tooling::shared::{PROVER_ID, RANDOMNESS, TICKET_BYTES};
+use fil_proofs_tooling::shared::{self, PROVER_ID, RANDOMNESS, TICKET_BYTES};
 use fil_proofs_tooling::{measure, Metadata};
-use filecoin_proofs::constants::{
-    POREP_PARTITIONS, WINDOW_POST_CHALLENGE_COUNT, WINDOW_POST_SECTOR_COUNT,
-};
+use filecoin_proofs::constants::{WINDOW_POST_CHALLENGE_COUNT, WINDOW_POST_SECTOR_COUNT};
 use filecoin_proofs::types::{
-    PaddedBytesAmount, PieceInfo, PoRepConfig, PoRepProofPartitions, PoStConfig,
-    SealCommitPhase1Output, SealPreCommitOutput, SealPreCommitPhase1Output, SectorSize,
-    UnpaddedBytesAmount,
+    PaddedBytesAmount, PieceInfo, PoStConfig, SealCommitPhase1Output, SealPreCommitOutput,
+    SealPreCommitPhase1Output, SectorSize, UnpaddedBytesAmount,
 };
 use filecoin_proofs::{
-    add_piece, generate_piece_commitment, generate_window_post, seal_commit_phase1,
-    seal_commit_phase2, seal_pre_commit_phase1, seal_pre_commit_phase2, validate_cache_for_commit,
-    validate_cache_for_precommit_phase2, verify_window_post, with_shape, PoStType,
-    PrivateReplicaInfo, PublicReplicaInfo,
+    add_piece, generate_piece_commitment, generate_synth_proofs, generate_window_post,
+    seal_commit_phase1, seal_commit_phase2, seal_pre_commit_phase1, seal_pre_commit_phase2,
+    validate_cache_for_commit, validate_cache_for_precommit_phase2, verify_window_post, with_shape,
+    PoStType, PrivateReplicaInfo, PublicReplicaInfo,
 };
 use log::info;
 use serde::{Deserialize, Serialize};
-use storage_proofs_core::{api_version::ApiVersion, merkle::MerkleTreeTrait, sector::SectorId};
+use storage_proofs_core::{
+    api_version::{ApiFeature, ApiVersion},
+    merkle::MerkleTreeTrait,
+    sector::SectorId,
+};
 const SECTOR_ID: u64 = 0;
 
 const PIECE_FILE: &str = "piece-file";
@@ -78,24 +79,7 @@ impl Report {
     }
 }
 
-fn get_porep_config(sector_size: u64, api_version: ApiVersion) -> PoRepConfig {
-    let arbitrary_porep_id = [99; 32];
-
-    // Replicate the staged sector, write the replica file to `sealed_path`.
-    PoRepConfig {
-        sector_size: SectorSize(sector_size),
-        partitions: PoRepProofPartitions(
-            *POREP_PARTITIONS
-                .read()
-                .expect("POREP_PARTITONS poisoned")
-                .get(&(sector_size))
-                .expect("unknown sector size"),
-        ),
-        porep_id: arbitrary_porep_id,
-        api_version,
-    }
-}
-
+#[allow(clippy::too_many_arguments)]
 fn run_pre_commit_phases<Tree: 'static + MerkleTreeTrait>(
     sector_size: u64,
     api_version: ApiVersion,
@@ -104,6 +88,7 @@ fn run_pre_commit_phases<Tree: 'static + MerkleTreeTrait>(
     skip_precommit_phase2: bool,
     test_resume: bool,
     skip_staging: bool,
+    features: Vec<ApiFeature>,
 ) -> anyhow::Result<((u64, u64), (u64, u64), (u64, u64))> {
     let (seal_pre_commit_phase1_measurement_cpu_time, seal_pre_commit_phase1_measurement_wall_time): (u64, u64) = if skip_precommit_phase1 {
             // generate no-op measurements
@@ -146,14 +131,14 @@ fn run_pre_commit_phases<Tree: 'static + MerkleTreeTrait>(
             let mut piece_file = OpenOptions::new().read(true).write(true).create(true).open(&piece_file_path)?;
             piece_file.write_all(&piece_bytes)?;
             piece_file.sync_all()?;
-            piece_file.seek(SeekFrom::Start(0))?;
+            piece_file.rewind()?;
 
             piece_file
         };
 
         let piece_info =
             generate_piece_commitment(&mut piece_file, sector_size_unpadded_bytes_amount)?;
-        piece_file.seek(SeekFrom::Start(0))?;
+        piece_file.rewind()?;
 
         add_piece(
             &mut piece_file,
@@ -164,11 +149,11 @@ fn run_pre_commit_phases<Tree: 'static + MerkleTreeTrait>(
 
         let piece_infos = vec![piece_info];
         let sector_id = SectorId::from(SECTOR_ID);
-        let porep_config = get_porep_config(sector_size, api_version);
+        let porep_config = shared::get_porep_config(sector_size, api_version, features.clone());
 
         let seal_pre_commit_phase1_measurement: FuncMeasurement<SealPreCommitPhase1Output<Tree>> = measure(|| {
             seal_pre_commit_phase1::<_, _, _, Tree>(
-                porep_config,
+                &porep_config,
                 cache_dir.clone(),
                 staged_file_path.clone(),
                 sealed_file_path.clone(),
@@ -202,7 +187,7 @@ fn run_pre_commit_phases<Tree: 'static + MerkleTreeTrait>(
             info!("Test resume requested.  Removing last layer {:?}", layers[layers.len() - 1]);
             std::fs::remove_file(&layers[layers.len() - 1])?;
 
-            return run_pre_commit_phases::<Tree>(sector_size, api_version, cache_dir, skip_precommit_phase1, skip_precommit_phase2, false, true);
+            return run_pre_commit_phases::<Tree>(sector_size, api_version, cache_dir, skip_precommit_phase1, skip_precommit_phase2, false, true, features);
         }
 
         // Persist piece_infos here
@@ -255,9 +240,8 @@ fn run_pre_commit_phases<Tree: 'static + MerkleTreeTrait>(
             res
         };
 
-        let porep_config = get_porep_config(sector_size, api_version);
-
         let sealed_file_path = cache_dir.join(SEALED_FILE);
+        let porep_config = shared::get_porep_config(sector_size, api_version, features);
 
         let validate_cache_for_precommit_phase2_measurement: FuncMeasurement<()> = measure(|| {
             validate_cache_for_precommit_phase2::<_, _, Tree>(
@@ -271,7 +255,7 @@ fn run_pre_commit_phases<Tree: 'static + MerkleTreeTrait>(
         let seal_pre_commit_phase2_measurement: FuncMeasurement<SealPreCommitOutput> =
             measure(|| {
                 seal_pre_commit_phase2::<_, _, Tree>(
-                    porep_config,
+                    &porep_config,
                     precommit_phase1_output,
                     cache_dir.clone(),
                     sealed_file_path.clone(),
@@ -345,6 +329,7 @@ pub fn run_window_post_bench<Tree: 'static + MerkleTreeTrait>(
     skip_commit_phase1: bool,
     skip_commit_phase2: bool,
     test_resume: bool,
+    api_features: Vec<ApiFeature>,
 ) -> anyhow::Result<()> {
     let (
         (seal_pre_commit_phase1_cpu_time_ms, seal_pre_commit_phase1_wall_time_ms),
@@ -365,6 +350,7 @@ pub fn run_window_post_bench<Tree: 'static + MerkleTreeTrait>(
             skip_precommit_phase2,
             test_resume,
             false, // skip staging
+            api_features.clone(),
         )
     }?;
 
@@ -398,11 +384,11 @@ pub fn run_window_post_bench<Tree: 'static + MerkleTreeTrait>(
         res
     };
 
-    let seed = [0u8; 32];
+    let seed = [1u8; 32];
     let comm_r = seal_pre_commit_output.comm_r;
 
     let sector_id = SectorId::from(SECTOR_ID);
-    let porep_config = get_porep_config(sector_size, api_version);
+    let porep_config = shared::get_porep_config(sector_size, api_version, api_features);
 
     let sealed_file_path = cache_dir.join(SEALED_FILE);
 
@@ -420,9 +406,25 @@ pub fn run_window_post_bench<Tree: 'static + MerkleTreeTrait>(
         })
         .expect("failed to validate cache for commit");
 
+        if porep_config.feature_enabled(ApiFeature::SyntheticPoRep) {
+            info!("SyntheticPoRep is enabled");
+            generate_synth_proofs::<_, Tree>(
+                &porep_config,
+                &cache_dir,
+                &sealed_file_path,
+                PROVER_ID,
+                sector_id,
+                TICKET_BYTES,
+                seal_pre_commit_output.clone(),
+                &piece_infos,
+            )?;
+        } else {
+            info!("SyntheticPoRep is NOT enabled");
+        }
+
         let seal_commit_phase1_measurement = measure(|| {
             seal_commit_phase1::<_, Tree>(
-                porep_config,
+                &porep_config,
                 cache_dir.clone(),
                 sealed_file_path.clone(),
                 PROVER_ID,
@@ -434,6 +436,7 @@ pub fn run_window_post_bench<Tree: 'static + MerkleTreeTrait>(
             )
         })
         .expect("failed in seal_commit_phase1");
+
         let phase1_output = seal_commit_phase1_measurement.return_value;
 
         // Persist commit phase1_output here
@@ -483,7 +486,7 @@ pub fn run_window_post_bench<Tree: 'static + MerkleTreeTrait>(
         };
 
         let seal_commit_phase2_measurement = measure(|| {
-            seal_commit_phase2::<Tree>(porep_config, commit_phase1_output, PROVER_ID, sector_id)
+            seal_commit_phase2::<Tree>(&porep_config, commit_phase1_output, PROVER_ID, sector_id)
         })
         .expect("failed in seal_commit_phase2");
 
@@ -594,8 +597,14 @@ pub fn run(
     skip_commit_phase1: bool,
     skip_commit_phase2: bool,
     test_resume: bool,
+    api_features: Vec<ApiFeature>,
 ) -> anyhow::Result<()> {
-    info!("Benchy Window PoSt: sector-size={}, api_version={}, preserve_cache={}, skip_precommit_phase1={}, skip_precommit_phase2={}, skip_commit_phase1={}, skip_commit_phase2={}, test_resume={}", sector_size, api_version, preserve_cache, skip_precommit_phase1, skip_precommit_phase2, skip_commit_phase1, skip_commit_phase2, test_resume);
+    let api_features_str = api_features
+        .iter()
+        .map(|api_feature| api_feature.to_string())
+        .collect::<Vec<String>>()
+        .join(",");
+    info!("Benchy Window PoSt: sector-size={}, api_version={}, preserve_cache={}, skip_precommit_phase1={}, skip_precommit_phase2={}, skip_commit_phase1={}, skip_commit_phase2={}, test_resume={}, api_features={}", sector_size, api_version, preserve_cache, skip_precommit_phase1, skip_precommit_phase2, skip_commit_phase1, skip_commit_phase2, test_resume, api_features_str);
 
     let cache_dir_specified = !cache.is_empty();
 
@@ -630,7 +639,7 @@ pub fn run(
     };
 
     if !cache_dir.exists() {
-        create_dir(&cache_dir)?;
+        create_dir_all(&cache_dir)?;
     }
     info!("Using cache directory {:?}", cache_dir);
 
@@ -646,5 +655,6 @@ pub fn run(
         skip_commit_phase1,
         skip_commit_phase2,
         test_resume,
+        api_features,
     )
 }

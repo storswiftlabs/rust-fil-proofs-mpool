@@ -1,11 +1,11 @@
 use anyhow::{ensure, Result};
-use storage_proofs_core::{api_version::ApiVersion, proof::ProofScheme};
-use storage_proofs_porep::stacked::{self, LayerChallenges, StackedDrg};
+use storage_proofs_core::{api_version::ApiFeature, proof::ProofScheme};
+use storage_proofs_porep::stacked::{self, Challenges, StackedDrg};
 use storage_proofs_post::fallback::{self, FallbackPoSt};
 
 use crate::{
-    constants::{DefaultPieceHasher, DRG_DEGREE, EXP_DEGREE, LAYERS, POREP_MINIMUM_CHALLENGES},
-    types::{MerkleTreeTrait, PaddedBytesAmount, PoStConfig},
+    constants::{DefaultPieceHasher, DRG_DEGREE, EXP_DEGREE, LAYERS, MAX_CHALLENGES_PER_PARTITION},
+    types::{MerkleTreeTrait, PoRepConfig, PoStConfig},
 };
 
 type WinningPostSetupParams = fallback::SetupParams;
@@ -15,17 +15,9 @@ type WindowPostSetupParams = fallback::SetupParams;
 pub type WindowPostPublicParams = fallback::PublicParams;
 
 pub fn public_params<Tree: 'static + MerkleTreeTrait>(
-    sector_bytes: PaddedBytesAmount,
-    partitions: usize,
-    porep_id: [u8; 32],
-    api_version: ApiVersion,
+    porep_config: &PoRepConfig,
 ) -> Result<stacked::PublicParams<Tree>> {
-    StackedDrg::<Tree, DefaultPieceHasher>::setup(&setup_params(
-        sector_bytes,
-        partitions,
-        porep_id,
-        api_version,
-    )?)
+    StackedDrg::<Tree, DefaultPieceHasher>::setup(&setup_params(porep_config)?)
 }
 
 pub fn winning_post_public_params<Tree: 'static + MerkleTreeTrait>(
@@ -74,25 +66,18 @@ pub fn window_post_setup_params(post_config: &PoStConfig) -> WindowPostSetupPara
     }
 }
 
-pub fn setup_params(
-    sector_bytes: PaddedBytesAmount,
-    partitions: usize,
-    porep_id: [u8; 32],
-    api_version: ApiVersion,
-) -> Result<stacked::SetupParams> {
-    let layer_challenges = select_challenges(
-        partitions,
-        *POREP_MINIMUM_CHALLENGES
-            .read()
-            .expect("POREP_MINIMUM_CHALLENGES poisoned")
-            .get(&u64::from(sector_bytes))
-            .expect("unknown sector size") as usize,
-        *LAYERS
-            .read()
-            .expect("LAYERS poisoned")
-            .get(&u64::from(sector_bytes))
-            .expect("unknown sector size"),
+pub fn setup_params(porep_config: &PoRepConfig) -> Result<stacked::SetupParams> {
+    let sector_bytes = porep_config.padded_bytes_amount();
+    let challenges = select_challenges(
+        usize::from(porep_config.partitions),
+        porep_config.minimum_challenges(),
+        &porep_config.api_features,
     );
+    let num_layers = *LAYERS
+        .read()
+        .expect("LAYERS poisoned")
+        .get(&u64::from(sector_bytes))
+        .expect("unknown sector size");
     let sector_bytes = u64::from(sector_bytes);
 
     ensure!(
@@ -109,25 +94,35 @@ pub fn setup_params(
         nodes,
         degree,
         expansion_degree,
-        porep_id,
-        layer_challenges,
-        api_version,
+        porep_id: porep_config.porep_id,
+        challenges,
+        num_layers,
+        api_version: porep_config.api_version,
+        api_features: porep_config.api_features.clone(),
     })
+}
+
+/// Division of x by y, rounding up.
+/// x and y must be > 0
+const fn div_ceil(x: usize, y: usize) -> usize {
+    1 + ((x - 1) / y)
 }
 
 fn select_challenges(
     partitions: usize,
     minimum_total_challenges: usize,
-    layers: usize,
-) -> LayerChallenges {
-    let mut count = 1;
-    let mut guess = LayerChallenges::new(layers, count);
-    while partitions * guess.challenges_count_all() < minimum_total_challenges {
-        count += 1;
-        guess = LayerChallenges::new(layers, count);
-    }
+    features: &[ApiFeature],
+) -> Challenges {
+    let challenges = div_ceil(minimum_total_challenges, partitions);
+    assert!(challenges <= usize::from(MAX_CHALLENGES_PER_PARTITION));
 
-    guess
+    if features.contains(&ApiFeature::SyntheticPoRep) {
+        Challenges::new_synthetic(challenges)
+    } else if features.contains(&ApiFeature::NonInteractivePoRep) {
+        Challenges::new_non_interactive(challenges)
+    } else {
+        Challenges::new_interactive(challenges)
+    }
 }
 
 #[cfg(test)]
@@ -138,7 +133,7 @@ mod tests {
 
     #[test]
     fn partition_layer_challenges_test() {
-        let f = |partitions| select_challenges(partitions, 12, 11).challenges_count_all();
+        let f = |partitions| select_challenges(partitions, 12, &[]).num_challenges_per_partition();
         // Update to ensure all supported PoRepProofPartitions options are represented here.
         assert_eq!(6, f(usize::from(PoRepProofPartitions(2))));
 
@@ -149,13 +144,15 @@ mod tests {
 
     #[test]
     fn test_winning_post_params() {
+        use storage_proofs_core::api_version::ApiVersion;
+
         let config = PoStConfig {
             typ: PoStType::Winning,
             priority: false,
             challenge_count: 66,
             sector_count: 1,
             sector_size: 2048u64.into(),
-            api_version: ApiVersion::V1_0_0,
+            api_version: ApiVersion::V1_2_0,
         };
 
         let params =

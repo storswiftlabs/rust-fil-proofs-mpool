@@ -29,7 +29,7 @@ impl Column {
     /// Create an empty `Column`, used in `blank_circuit`s.
     pub fn empty<Tree: MerkleTreeTrait>(params: &PublicParams<Tree>) -> Self {
         Column {
-            rows: vec![None; params.layer_challenges.layers()],
+            rows: vec![None; params.num_layers],
         }
     }
 
@@ -52,13 +52,13 @@ impl Column {
 
         Ok(AllocatedColumn { rows })
     }
+
+    pub(crate) fn len(&self) -> usize {
+        self.rows.len()
+    }
 }
 
 impl AllocatedColumn {
-    pub fn len(&self) -> usize {
-        self.rows.len()
-    }
-
     /// Creates the column hash of this column.
     pub fn hash<CS: ConstraintSystem<Fr>>(
         &self,
@@ -76,5 +76,9 @@ impl AllocatedColumn {
             self.rows.len()
         );
         &self.rows[layer - 1]
+    }
+
+    pub(crate) fn len(&self) -> usize {
+        self.rows.len()
     }
 }

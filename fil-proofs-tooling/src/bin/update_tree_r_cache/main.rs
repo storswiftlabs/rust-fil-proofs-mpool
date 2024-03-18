@@ -11,16 +11,15 @@ use filecoin_proofs::{
     SectorShapeSub8, SectorShapeTop2, OCT_ARITY,
 };
 use generic_array::typenum::Unsigned;
-use memmap::MmapOptions;
+use memmap2::MmapOptions;
 use merkletree::{
     merkle::get_merkle_tree_len,
-    store::{ExternalReader, ReplicaConfig, Store, StoreConfig},
+    store::{ExternalReader, LevelCacheStore, ReplicaConfig, Store, StoreConfig},
 };
 use storage_proofs_core::{
     cache_key::CacheKey,
     merkle::{
-        create_lc_tree, get_base_tree_count, split_config_and_replica, LCStore, LCTree,
-        MerkleTreeTrait,
+        create_lc_tree, get_base_tree_count, split_config_and_replica, LCTree, MerkleTreeTrait,
     },
     util::{default_rows_to_discard, NODE_SIZE},
 };
@@ -38,12 +37,12 @@ fn get_tree_r_info(
 
     // If the cache dir doesn't exist, create it
     if !Path::new(&cache).exists() {
-        create_dir_all(&cache)?;
+        create_dir_all(cache)?;
     }
 
     // Create a StoreConfig from the provided cache path
     let tree_r_last_config = StoreConfig::new(
-        &cache,
+        cache,
         CacheKey::CommRLastTree.to_string(),
         default_rows_to_discard(base_tree_leafs, OCT_ARITY),
     );
@@ -68,13 +67,12 @@ fn get_tree_r_last_root(
     let base_tree_len = get_merkle_tree_len(base_tree_leafs, OCT_ARITY)?;
     let tree_r_last_root = if is_sector_shape_base(sector_size) {
         ensure!(configs.len() == 1, "Invalid tree-shape specified");
-        let store = LCStore::<DefaultTreeDomain>::new_from_disk_with_reader(
+        let store = LevelCacheStore::new_from_disk_with_reader(
             base_tree_len,
             OCT_ARITY,
             &configs[0],
             ExternalReader::new_from_path(&replica_config.path)?,
         )?;
-
         let tree_r_last = SectorShapeBase::from_data_store(store, base_tree_leafs)?;
         tree_r_last.root()
     } else if is_sector_shape_sub2(sector_size) {
@@ -128,7 +126,7 @@ fn build_tree_r_last<Tree: MerkleTreeTrait>(
     let f_data = OpenOptions::new()
         .read(true)
         .write(true)
-        .open(&replica_path)
+        .open(replica_path)
         .with_context(|| format!("could not open replica_path={:?}", replica_path))?;
     let input_mmap = unsafe {
         MmapOptions::new()
@@ -223,7 +221,7 @@ fn run_verify(sector_size: usize, cache: &Path, replica_path: &Path) -> Result<(
     // First, read the roots from the cached trees on disk
     let mut cached_base_tree_roots: Vec<DefaultTreeDomain> = Vec::with_capacity(tree_count);
     for (i, config) in configs.iter().enumerate().take(tree_count) {
-        let store = LCStore::new_from_disk_with_reader(
+        let store = LevelCacheStore::new_from_disk_with_reader(
             base_tree_len,
             OCT_ARITY,
             config,
@@ -253,12 +251,12 @@ fn run_verify(sector_size: usize, cache: &Path, replica_path: &Path) -> Result<(
     // with any existing ones on disk) and check if the roots match what's cached on disk
     let tmp_dir = tempdir().unwrap();
     let tmp_path = tmp_dir.path();
-    create_dir_all(&tmp_path)?;
+    create_dir_all(tmp_path)?;
 
     let (rebuilt_tree_r_last_root, rebuilt_base_tree_roots) =
         run_rebuild(sector_size, tmp_path, replica_path)?;
 
-    remove_dir_all(&tmp_path)?;
+    remove_dir_all(tmp_path)?;
 
     let status = match_str(tree_r_last_root, p_aux.comm_r_last);
     let rebuilt_status = match_str(rebuilt_tree_r_last_root, p_aux.comm_r_last);

@@ -1,3 +1,5 @@
+use std::cmp;
+
 use anyhow::{ensure, Context};
 use bellperson::{
     groth16::{
@@ -20,10 +22,16 @@ use rayon::prelude::{
 use crate::{
     error::Result,
     multi_proof::MultiProof,
-    parameter_cache::{CacheableParameters, ParameterSetMetadata},
+    parameter_cache::{Bls12GrothParams, CacheableParameters, ParameterSetMetadata},
     partitions::partition_count,
     proof::ProofScheme,
 };
+
+/// The maximum number of Groth16 proofs that will be processed in parallel. This limit is set as
+/// synthesis takes a lot of memory. The current value is based on the number of proofs that are
+/// run in parallel in the interactive PoRep (the number of partitions). This way there's just a
+/// single batch for the interactive PoRep, but the non-interactive PoRep is split into batches.
+const MAX_GROTH16_BATCH_SIZE: usize = 10;
 
 #[derive(Clone)]
 pub struct SetupParams<'a, S: ProofScheme<'a>> {
@@ -78,12 +86,12 @@ where
     }
 
     /// prove is equivalent to ProofScheme::prove.
-    fn prove<'b>(
+    fn prove(
         pub_params: &PublicParams<'a, S>,
         pub_in: &S::PublicInputs,
         priv_in: &S::PrivateInputs,
-        groth_params: &'b groth16::MappedParameters<Bls12>,
-    ) -> Result<MultiProof<'b>> {
+        groth_params: &Bls12GrothParams,
+    ) -> Result<Vec<groth16::Proof<Bls12>>> {
         let partition_count = Self::partition_count(pub_params);
 
         // This will always run at least once, since there cannot be zero partitions.
@@ -109,15 +117,15 @@ where
         )?;
         info!("snark_proof:finish");
 
-        Ok(MultiProof::new(groth_proofs, &groth_params.pvk))
+        Ok(groth_proofs)
     }
 
-    fn prove_with_vanilla<'b>(
+    fn prove_with_vanilla(
         pub_params: &PublicParams<'a, S>,
         pub_in: &S::PublicInputs,
         vanilla_proofs: Vec<S::Proof>,
-        groth_params: &'b groth16::MappedParameters<Bls12>,
-    ) -> Result<MultiProof<'b>> {
+        groth_params: &Bls12GrothParams,
+    ) -> Result<Vec<groth16::Proof<Bls12>>> {
         let partition_count = Self::partition_count(pub_params);
 
         // This will always run at least once, since there cannot be zero partitions.
@@ -133,7 +141,7 @@ where
         )?;
         info!("snark_proof:finish");
 
-        Ok(MultiProof::new(groth_proofs, &groth_params.pvk))
+        Ok(groth_proofs)
     }
 
     // verify is equivalent to ProofScheme::verify.
@@ -233,7 +241,7 @@ where
         pub_in: &S::PublicInputs,
         vanilla_proofs: Vec<S::Proof>,
         pub_params: &S::PublicParams,
-        groth_params: &groth16::MappedParameters<Bls12>,
+        groth_params: &Bls12GrothParams,
         priority: bool,
     ) -> Result<Vec<groth16::Proof<Bls12>>> {
         let mut rng = OsRng;
@@ -242,7 +250,7 @@ where
             "cannot create a circuit proof over missing vanilla proofs"
         );
 
-        let circuits = vanilla_proofs
+        let mut circuits = vanilla_proofs
             .into_par_iter()
             .enumerate()
             .map(|(k, vanilla_proof)| {
@@ -256,14 +264,26 @@ where
             })
             .collect::<Result<Vec<_>>>()?;
 
-        let groth_proofs = if priority {
-            create_random_proof_batch_in_priority(circuits, groth_params, &mut rng)?
+        // The same function is used within the while loop below, decide on the function once and
+        // not on every iteration.
+        let create_random_proof_batch_fun = if priority {
+            create_random_proof_batch_in_priority
         } else {
-            create_random_proof_batch(circuits, groth_params, &mut rng)?
+            create_random_proof_batch
         };
 
+        let mut groth_proofs = Vec::with_capacity(circuits.len());
+        // Bellperson expects a vector of proofs, hence drain it from the list of proofs, so that
+        // we don't need to keep an extra copy around.
+        while !circuits.is_empty() {
+            let size = cmp::min(MAX_GROTH16_BATCH_SIZE, circuits.len());
+            let batch = circuits.drain(0..size).collect();
+            let proofs = create_random_proof_batch_fun(batch, groth_params, &mut rng)?;
+            groth_proofs.extend_from_slice(&proofs);
+        }
+
         groth_proofs
-            .into_iter()
+            .iter()
             .map(|groth_proof| {
                 let mut proof_vec = Vec::new();
                 groth_proof.write(&mut proof_vec)?;
@@ -305,12 +325,12 @@ where
         aggregate_proof: &groth16::aggregate::AggregateProof<Bls12>,
         version: groth16::aggregate::AggregateVersion,
     ) -> Result<bool> {
-        let mut rng = OsRng;
+        let rng = OsRng;
 
         Ok(verify_aggregate_proof(
             ip_verifier_srs,
             pvk,
-            &mut rng,
+            rng,
             public_inputs,
             aggregate_proof,
             hashed_seeds_and_comm_rs,
@@ -349,7 +369,7 @@ where
     fn groth_params<R: RngCore>(
         rng: Option<&mut R>,
         public_params: &S::PublicParams,
-    ) -> Result<groth16::MappedParameters<Bls12>> {
+    ) -> Result<Bls12GrothParams> {
         Self::get_groth_params(rng, Self::blank_circuit(public_params), public_params)
     }
 

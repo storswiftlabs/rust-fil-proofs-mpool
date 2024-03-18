@@ -1,7 +1,9 @@
-use anyhow::{anyhow, Result};
-use chrono::{DateTime, TimeZone, Utc};
-use git2::Repository;
+use std::env::consts::ARCH;
+
+use anyhow::Result;
+use chrono::{DateTime, Utc};
 use serde::Serialize;
+use sysinfo::{RefreshKind, System, SystemExt};
 
 /// Captures metadata about the current setup.
 #[derive(Debug, Serialize)]
@@ -32,18 +34,12 @@ pub struct GitMetadata {
 
 impl GitMetadata {
     pub fn new() -> Result<Self> {
-        let repo_path = if let Ok(mdir) = std::env::var("CARGO_MANIFEST_DIR") {
-            std::path::Path::new(&mdir).into()
-        } else {
-            std::env::current_dir()?
-        };
-        let repo = Repository::discover(&repo_path)?;
-        let head = repo.head()?;
-        let commit = head.peel_to_commit()?;
-        let date = Utc.timestamp(commit.time().seconds(), 0);
-
+        // Unwrap is OK as vergen returns a valid timestamp.
+        let date = env!("VERGEN_GIT_COMMIT_TIMESTAMP")
+            .parse::<DateTime<Utc>>()
+            .expect("VERGEN_GIT_COMMIT_TIMESTAMP error");
         Ok(GitMetadata {
-            hash: commit.id().to_string(),
+            hash: env!("VERGEN_GIT_SHA").to_string(),
             date,
         })
     }
@@ -60,22 +56,18 @@ pub struct SystemMetadata {
     processor_base_frequency_hz: u16,
     processor_max_frequency_hz: u16,
     processor_features: String,
-    processor_cores_logical: u64,
-    processor_cores_physical: u64,
+    processor_cores_logical: usize,
+    processor_cores_physical: usize,
     memory_total_bytes: u64,
 }
 
 impl SystemMetadata {
     pub fn new() -> Result<Self> {
-        use async_std::task::block_on;
-        let host = block_on(async { heim::host::platform().await })
-            .map_err(|_| anyhow!("Failed to retrieve host information"))?;
-        let memory = block_on(async { heim::memory::memory().await })
-            .map_err(|_| anyhow!("Failed to retrieve memory information"))?;
-        let cpu_logical = block_on(async { heim::cpu::logical_count().await })
-            .map_err(|_| anyhow!("Failed to retrieve cpu logical count information"))?;
-        let cpu_physical = block_on(async { heim::cpu::physical_count().await })
-            .map_err(|_| anyhow!("Failed to retrieve cpu physical count information"))?;
+        let system = System::new_with_specifics(
+            RefreshKind::new()
+                .with_cpu(Default::default())
+                .with_memory(),
+        );
 
         let (processor, base, max, features) = {
             #[cfg(target_arch = "x86_64")]
@@ -111,17 +103,17 @@ impl SystemMetadata {
         };
 
         Ok(SystemMetadata {
-            system: host.system().into(),
-            release: host.release().into(),
-            version: host.version().into(),
-            architecture: host.architecture().as_str().into(),
+            system: system.long_os_version().unwrap_or_default(),
+            release: system.kernel_version().unwrap_or_default(),
+            version: system.os_version().unwrap_or_default(),
+            architecture: ARCH.to_string(),
             processor,
             processor_base_frequency_hz: base,
             processor_max_frequency_hz: max,
             processor_features: features,
-            processor_cores_logical: cpu_logical,
-            processor_cores_physical: cpu_physical.unwrap_or_default(),
-            memory_total_bytes: memory.total().get::<heim::units::information::byte>(),
+            processor_cores_logical: system.cpus().len(),
+            processor_cores_physical: system.physical_core_count().unwrap_or_default(),
+            memory_total_bytes: system.total_memory(),
         })
     }
 }

@@ -7,6 +7,73 @@ and this project adheres to [Semantic Versioning](https://book.async.rs/overview
 
 ## Unreleased
 
+## [16.1.0] - 2023-11-08
+
+- Update lifecycle upgrade 'big-tests' [#1737](https://github.com/filecoin-project/rust-fil-proofs/pull/1737)
+- Add optional support for sealing without requiring t_aux [#1717](https://github.com/filecoin-project/rust-fil-proofs/pull/1717)
+- Re-factor p_aux/t_aux handling [#1721](https://github.com/filecoin-project/rust-fil-proofs/pull/1721)
+- Add a parameter id test [#1728](https://github.com/filecoin-project/rust-fil-proofs/pull/1728)
+- Additional CI improvements [#1727](https://github.com/filecoin-project/rust-fil-proofs/pull/1727)
+- Re-factor cache cleaning [#1723](https://github.com/filecoin-project/rust-fil-proofs/pull/1723)
+- Re-factor rows to discard values [#1724](https://github.com/filecoin-project/rust-fil-proofs/pull/1724)
+- CI improvements [#1726](https://github.com/filecoin-project/rust-fil-proofs/pull/1726)
+- Re-factors and clean-ups [#1719](https://github.com/filecoin-project/rust-fil-proofs/pull/1719)
+- Simplify a StoreConfig usage [#1716](https://github.com/filecoin-project/rust-fil-proofs/pull/1716)
+
+## [16.0.0] - 2023-09-05
+
+- Add optional support for SupraSeal C2 proving [#1709](https://github.com/filecoin-project/rust-fil-proofs/pull/1709)
+- Add support and API for SyntheticPoRep [#1701](https://github.com/filecoin-project/rust-fil-proofs/pull/1701)
+- Downgrade harmless warning to trace logging [#1714](https://github.com/filecoin-project/rust-fil-proofs/pull/1714)
+- Use more efficient MultiProof reader [#1713](https://github.com/filecoin-project/rust-fil-proofs/pull/1713)
+
+## [15.0.0] - 2023-06-30
+
+- Add SyntheticPoRep audit results to repo [#1710](https://github.com/filecoin-project/rust-fil-proofs/pull/1710)
+- Remove DRG PoRep (historical code; unused on mainnet) [#1684](https://github.com/filecoin-project/rust-fil-proofs/pull/1684)
+- Document the TreeRLast tree generation [#1699](https://github.com/filecoin-project/rust-fil-proofs/pull/1699)
+- Optimize add_piece method [#1707](https://github.com/filecoin-project/rust-fil-proofs/pull/1707)
+- Refactor replicate_phase2 arguments [#1700](https://github.com/filecoin-project/rust-fil-proofs/pull/1700)
+- Add public API to generate tree_r_last and tree_c [#1705](https://github.com/filecoin-project/rust-fil-proofs/pull/1705)
+- Add method to decode a range from an updated sector [#1704](https://github.com/filecoin-project/rust-fil-proofs/pull/1704)
+- Clarify h and h_select usage [#1696](https://github.com/filecoin-project/rust-fil-proofs/pull/1696)
+- Add new from trait for PoseidonDomain [#1703](https://github.com/filecoin-project/rust-fil-proofs/pull/1703)
+- Ensure that number of layers matches column arity [#1702](https://github.com/filecoin-project/rust-fil-proofs/pull/1702)
+- Clean up some code and mutability usage [#1698](https://github.com/filecoin-project/rust-fil-proofs/pull/1698)
+- Remove superfluous API generic [#1695](https://github.com/filecoin-project/rust-fil-proofs/pull/1695)
+- copy_parents_data optimization using base parents only [#1660](https://github.com/filecoin-project/rust-fil-proofs/pull/1660)
+- Update to the newest version of ff dependency [#1691](https://github.com/filecoin-project/rust-fil-proofs/pull/1691)
+- Replace heim dep with sysinfo [#1694](https://github.com/filecoin-project/rust-fil-proofs/pull/1694)
+- rustix dependency update [#1693](https://github.com/filecoin-project/rust-fil-proofs/pull/1693)
+- TreeD size and rows to discard calculation fix [#1692](https://github.com/filecoin-project/rust-fil-proofs/pull/1692)
+- Benchy fix for output results without git info [#1688](https://github.com/filecoin-project/rust-fil-proofs/pull/1688)
+- Add parallel tasks to WindowPoSt bench [#1686](https://github.com/filecoin-project/rust-fil-proofs/pull/1686)
+- Return last layer from Labels [#1685](https://github.com/filecoin-project/rust-fil-proofs/pull/1685)
+- Support optional API features for ranges of API versions [#1683](https://github.com/filecoin-project/rust-fil-proofs/pull/1683)
+
+## [14.0.0] - 2023-03-17
+
+- Allow PC1 unreplicated data to be /dev/zero [#1681](https://github.com/filecoin-project/rust-fil-proofs/pull/1681)
+- Add additional tests for faulty sector reporting [#1680](https://github.com/filecoin-project/rust-fil-proofs/pull/1680)
+- Make builds on stable and aarch64 possible [#1679](https://github.com/filecoin-project/rust-fil-proofs/pull/1679)
+- Fix the open grindability issue [#1661](https://github.com/filecoin-project/rust-fil-proofs/pull/1661)
+- Add the v13 Cargo.lock file [#1673](https://github.com/filecoin-project/rust-fil-proofs/pull/1673)
+
+## [13.0.0] - 2023-03-06
+
+- Disable broken coverage job CI coverage job [#1669](https://github.com/filecoin-project/rust-fil-proofs/pull/1669)
+- Update rust-toolchain to 1.67.1 [#1668](https://github.com/filecoin-project/rust-fil-proofs/pull/1668)
+- Clean up tree definitions [#1655](https://github.com/filecoin-project/rust-fil-proofs/pull/1655)
+- Introduce PoRepConfig::new_groth16() [#1635](https://github.com/filecoin-project/rust-fil-proofs/pull/1635)
+- Fix broken links in README.md [#1649](https://github.com/filecoin-project/rust-fil-proofs/pull/1649)
+- Update ec-gpu-gen [#1638](https://github.com/filecoin-project/rust-fil-proofs/pull/1638)
+- Use current process binding to limit thread cores [#1633](https://github.com/filecoin-project/rust-fil-proofs/pull/1633)
+- Ensure that WindowPoSt works on read-only files [#1630](https://github.com/filecoin-project/rust-fil-proofs/pull/1630)
+- Added Tarpaulin Coverage [#1628](https://github.com/filecoin-project/rust-fil-proofs/pull/1628)
+- Use memmap2 instead of mapr [#1624](https://github.com/filecoin-project/rust-fil-proofs/pull/1624)
+- Update CircleCI to xcode 13.4.1 [#1625](https://github.com/filecoin-project/rust-fil-proofs/pull/1625)
+- Update rust-toolchain to 1.62.0 [#1623](https://github.com/filecoin-project/rust-fil-proofs/pull/1623)
+
 ## [12.0.0] - 2022-08-04
 
 - Add additional sector logging [#1610](https://github.com/filecoin-project/rust-fil-proofs/pull/1610)
@@ -352,7 +419,12 @@ mainnet ready and will be replaced in a future version.  This release is intende
 
 - Initial stable release
 
-[Unreleased]: https://github.com/filecoin-project/rust-fil-proofs/compare/v12.0.0...HEAD
+[Unreleased]: https://github.com/filecoin-project/rust-fil-proofs/compare/v16.1.0...HEAD
+[16.1.0]: https://github.com/filecoin-project/rust-fil-proofs/tree/releases/v16.1.0
+[16.0.0]: https://github.com/filecoin-project/rust-fil-proofs/tree/releases/v16.0.0
+[15.0.0]: https://github.com/filecoin-project/rust-fil-proofs/tree/releases/v15.0.0
+[14.0.0]: https://github.com/filecoin-project/rust-fil-proofs/tree/releases/v14.0.0
+[13.0.0]: https://github.com/filecoin-project/rust-fil-proofs/tree/releases/v13.0.0
 [12.0.0]: https://github.com/filecoin-project/rust-fil-proofs/tree/releases/v12.0.0
 [11.1.1]: https://github.com/filecoin-project/rust-fil-proofs/tree/releases/v11.1.1
 [11.1.0]: https://github.com/filecoin-project/rust-fil-proofs/tree/releases/v11.1.0

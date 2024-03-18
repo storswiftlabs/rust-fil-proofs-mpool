@@ -1,19 +1,18 @@
-use std::any::TypeId;
-use std::fs;
+use std::fs::{self, File};
+use std::io::{BufReader, BufWriter};
 use std::marker::PhantomData;
 use std::panic::panic_any;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
-use anyhow::Context;
+use anyhow::{ensure, Context};
 use bincode::deserialize;
 use blstrs::Scalar as Fr;
 use fdlimit::raise_fd_limit;
-use ff::PrimeField;
-use filecoin_hashers::{poseidon::PoseidonHasher, Domain, HashFunction, Hasher, PoseidonArity};
-use generic_array::typenum::{Unsigned, U0, U11, U2, U8};
+use filecoin_hashers::{Domain, HashFunction, Hasher, PoseidonArity};
+use generic_array::typenum::{Unsigned, U0, U11, U2};
 use lazy_static::lazy_static;
-use log::{error, info, trace, warn};
+use log::{error, info, trace};
 use merkletree::{
     merkle::{get_merkle_tree_len, is_merkle_tree_size_valid},
     store::{DiskStore, Store, StoreConfig},
@@ -29,7 +28,7 @@ use storage_proofs_core::{
     measurements::{measure_op, Operation},
     merkle::{
         create_disk_tree, create_lc_tree, get_base_tree_count, split_config,
-        split_config_and_replica, BinaryMerkleTree, DiskTree, LCTree, MerkleProofTrait, MerkleTree,
+        split_config_and_replica, BinaryMerkleTree, DiskTree, LCTree, MerkleProofTrait,
         MerkleTreeTrait,
     },
     settings::SETTINGS,
@@ -38,21 +37,20 @@ use storage_proofs_core::{
 use yastl::Pool;
 
 use crate::{
-    encode::{decode, encode, encode_fr},
+    encode::{decode, encode},
     stacked::vanilla::{
-        challenges::LayerChallenges,
+        challenges::{Challenges, SynthChallenges},
         column::Column,
         create_label,
         graph::StackedBucketGraph,
         hash::hash_single_column,
         params::{
             get_node, Labels, LabelsCache, PersistentAux, Proof, PublicInputs, PublicParams,
-            ReplicaColumnProof, Tau, TemporaryAux, TemporaryAuxCache, TransformedLayers,
-            BINARY_ARITY,
+            ReplicaColumnProof, SynthProofs, Tau, TemporaryAux, TemporaryAuxCache,
+            TransformedLayers, BINARY_ARITY,
         },
         EncodingProof, LabelingProof,
     },
-    PoRep,
 };
 
 pub const TOTAL_PARENTS: usize = 37;
@@ -100,20 +98,140 @@ impl<'a, Tree: 'static + MerkleTreeTrait, G: 'static + Hasher> StackedDrg<'a, Tr
         pub_inputs: &PublicInputs<<Tree::Hasher as Hasher>::Domain, <G as Hasher>::Domain>,
         p_aux: &PersistentAux<<Tree::Hasher as Hasher>::Domain>,
         t_aux: &TemporaryAuxCache<Tree, G>,
-        layer_challenges: &LayerChallenges,
-        layers: usize,
+        challenges: &Challenges,
+        num_layers: usize,
         partition_count: usize,
     ) -> Result<Vec<Vec<Proof<Tree, G>>>> {
-        assert!(layers > 0);
-        assert_eq!(t_aux.labels.len(), layers);
-
-        let graph_size = graph.size();
-
+        assert!(num_layers > 0);
         // Sanity checks on restored trees.
         assert!(pub_inputs.tau.is_some());
+
+        match challenges {
+            Challenges::Interactive(interactive_challenges) => {
+                info!("generating interactive vanilla proofs");
+
+                let seed = pub_inputs
+                    .seed
+                    .expect("seed must be set for interactive vanilla proofs");
+
+                (0..partition_count)
+                    .map(|k| {
+                        trace!("proving partition {}/{}", k + 1, partition_count);
+
+                        // Derive the set of challenges we are proving over.
+                        let challenge_positions = interactive_challenges.derive(
+                            graph.size(),
+                            &pub_inputs.replica_id,
+                            &seed,
+                            k as u8,
+                        );
+
+                        Self::prove_layers_generate(
+                            graph,
+                            pub_inputs,
+                            p_aux.comm_c,
+                            t_aux,
+                            challenge_positions,
+                            num_layers,
+                        )
+                    })
+                    .collect::<Result<Vec<Vec<Proof<Tree, G>>>>>()
+            }
+            Challenges::Synth(synth_challenges) => {
+                // If there are no synthetic vanilla proofs stored on disk yet, generate them.
+                if pub_inputs.seed.is_none() {
+                    info!("generating synthetic vanilla proofs in a single partition");
+                    assert_eq!(partition_count, 1);
+
+                    let comm_r = pub_inputs.tau.as_ref().expect("tau is set").comm_r;
+                    // Derive the set of challenges we are proving over.
+                    let challenge_positions = SynthChallenges::derive_synthetic(
+                        graph.size(),
+                        &pub_inputs.replica_id,
+                        &comm_r,
+                    );
+
+                    let synth_proofs = Self::prove_layers_generate(
+                        graph,
+                        pub_inputs,
+                        p_aux.comm_c,
+                        t_aux,
+                        challenge_positions,
+                        num_layers,
+                    )?;
+
+                    Self::write_synth_proofs(
+                        &synth_proofs,
+                        pub_inputs,
+                        graph,
+                        synth_challenges,
+                        num_layers,
+                        t_aux.synth_proofs_path(),
+                    )?;
+                    Ok(vec![vec![]; partition_count])
+                }
+                // Else the synthetic vanilla proofs are stored on disk, read and return the proofs
+                // corresponding to the porep challlenge set.
+                else {
+                    Self::read_porep_proofs_from_synth(
+                        graph.size(),
+                        pub_inputs,
+                        synth_challenges,
+                        num_layers,
+                        t_aux.synth_proofs_path(),
+                        partition_count,
+                    )
+                    .map_err(|error| {
+                        info!(
+                            "failed to read porep proofs from synthetic proofs file: {:?}",
+                            t_aux.synth_proofs_path(),
+                        );
+                        error
+                    })
+                }
+            }
+            Challenges::Ni(ni_challenges) => {
+                info!("generating non-interactive vanilla proofs");
+
+                let comm_r = pub_inputs.tau.as_ref().expect("tau is set").comm_r;
+                (0..partition_count)
+                    .map(|k| {
+                        trace!("proving partition {}/{}", k + 1, partition_count);
+
+                        // Derive the set of challenges we are proving over.
+                        let challenge_positions = ni_challenges.derive(
+                            graph.size(),
+                            &pub_inputs.replica_id,
+                            &comm_r,
+                            k as u8,
+                        );
+
+                        Self::prove_layers_generate(
+                            graph,
+                            pub_inputs,
+                            p_aux.comm_c,
+                            t_aux,
+                            challenge_positions,
+                            num_layers,
+                        )
+                    })
+                    .collect::<Result<Vec<Vec<Proof<Tree, G>>>>>()
+            }
+        }
+    }
+
+    fn prove_layers_generate(
+        graph: &StackedBucketGraph<Tree::Hasher>,
+        pub_inputs: &PublicInputs<<Tree::Hasher as Hasher>::Domain, <G as Hasher>::Domain>,
+        comm_c: <Tree::Hasher as Hasher>::Domain,
+        t_aux: &TemporaryAuxCache<Tree, G>,
+        challenges: Vec<usize>,
+        num_layers: usize,
+    ) -> Result<Vec<Proof<Tree, G>>> {
+        assert_eq!(t_aux.labels.len(), num_layers);
         assert_eq!(
             pub_inputs.tau.as_ref().expect("as_ref failure").comm_d,
-            t_aux.tree_d.root()
+            t_aux.tree_d.as_ref().expect("failed to get tree_d").root()
         );
 
         let get_drg_parents_columns = |x: usize| -> Result<Vec<Column<Tree::Hasher>>> {
@@ -146,164 +264,300 @@ impl<'a, Tree: 'static + MerkleTreeTrait, G: 'static + Hasher> StackedDrg<'a, Tr
                 .collect()
         };
 
-        (0..partition_count)
-            .map(|k| {
-                trace!("proving partition {}/{}", k + 1, partition_count);
+        THREAD_POOL.scoped(|scope| {
+            // Stacked commitment specifics
+            challenges
+                .into_par_iter()
+                .enumerate()
+                .map(|(challenge_index, challenge)| {
+                    trace!(" challenge {} ({})", challenge, challenge_index);
+                    assert!(challenge < graph.size(), "Invalid challenge");
+                    assert!(challenge > 0, "Invalid challenge");
 
-                // Derive the set of challenges we are proving over.
-                let challenges = pub_inputs.challenges(layer_challenges, graph_size, Some(k));
+                    let comm_d_proof = t_aux
+                        .tree_d
+                        .as_ref()
+                        .expect("failed to get tree_d")
+                        .gen_proof(challenge)?;
 
-                // Stacked commitment specifics
-                challenges
-                    .into_par_iter()
-                    .enumerate()
-                    .map(|(challenge_index, challenge)| {
-                        trace!(" challenge {} ({})", challenge, challenge_index);
-                        assert!(challenge < graph.size(), "Invalid challenge");
-                        assert!(challenge > 0, "Invalid challenge");
+                    let comm_d_proof_inner = comm_d_proof.clone();
+                    let challenge_inner = challenge;
+                    scope.execute(move || {
+                        assert!(comm_d_proof_inner.validate(challenge_inner));
+                    });
 
-                        // Initial data layer openings (c_X in Comm_D)
-                        let comm_d_proof = t_aux.tree_d.gen_proof(challenge)?;
-                        assert!(comm_d_proof.validate(challenge));
+                    // Stacked replica column openings
+                    let rcp = {
+                        let (c_x, drg_parents, exp_parents) = {
+                            assert!(t_aux.tree_c.is_some());
+                            let tree_c = t_aux.tree_c.as_ref().expect("failed to get tree_c");
+                            assert_eq!(comm_c, tree_c.root());
 
-                        // Stacked replica column openings
-                        let rcp = {
-                            let (c_x, drg_parents, exp_parents) = {
-                                assert_eq!(p_aux.comm_c, t_aux.tree_c.root());
-                                let tree_c = &t_aux.tree_c;
+                            // All labels in C_X
+                            trace!("  c_x");
+                            let c_x = t_aux.column(challenge as u32)?.into_proof(tree_c)?;
 
-                                // All labels in C_X
-                                trace!("  c_x");
-                                let c_x = t_aux.column(challenge as u32)?.into_proof(tree_c)?;
+                            // All labels in the DRG parents.
+                            trace!("  drg_parents");
+                            let drg_parents = get_drg_parents_columns(challenge)?
+                                .into_iter()
+                                .map(|column| column.into_proof(tree_c))
+                                .collect::<Result<_>>()?;
 
-                                // All labels in the DRG parents.
-                                trace!("  drg_parents");
-                                let drg_parents = get_drg_parents_columns(challenge)?
-                                    .into_iter()
-                                    .map(|column| column.into_proof(tree_c))
-                                    .collect::<Result<_>>()?;
+                            // Labels for the expander parents
+                            trace!("  exp_parents");
+                            let exp_parents = get_exp_parents_columns(challenge)?
+                                .into_iter()
+                                .map(|column| column.into_proof(tree_c))
+                                .collect::<Result<_>>()?;
 
-                                // Labels for the expander parents
-                                trace!("  exp_parents");
-                                let exp_parents = get_exp_parents_columns(challenge)?
-                                    .into_iter()
-                                    .map(|column| column.into_proof(tree_c))
-                                    .collect::<Result<_>>()?;
-
-                                (c_x, drg_parents, exp_parents)
-                            };
-
-                            ReplicaColumnProof {
-                                c_x,
-                                drg_parents,
-                                exp_parents,
-                            }
+                            (c_x, drg_parents, exp_parents)
                         };
 
-                        // Final replica layer openings
-                        trace!("final replica layer openings");
-                        let comm_r_last_proof = t_aux.tree_r_last.gen_cached_proof(
-                            challenge,
-                            Some(t_aux.tree_r_last_config_rows_to_discard),
-                        )?;
+                        ReplicaColumnProof {
+                            c_x,
+                            drg_parents,
+                            exp_parents,
+                        }
+                    };
 
-                        debug_assert!(comm_r_last_proof.validate(challenge));
+                    // Final replica layer openings
+                    trace!("final replica layer openings");
+                    let comm_r_last_proof = t_aux.tree_r_last.gen_cached_proof(
+                        challenge,
+                        Some(t_aux.tree_r_last_config_rows_to_discard),
+                    )?;
 
-                        // Labeling Proofs Layer 1..l
-                        let mut labeling_proofs = Vec::with_capacity(layers);
-                        let mut encoding_proof = None;
+                    let comm_r_last_proof_inner = comm_r_last_proof.clone();
+                    scope.execute(move || {
+                        debug_assert!(comm_r_last_proof_inner.validate(challenge));
+                    });
 
-                        for layer in 1..=layers {
-                            trace!("  encoding proof layer {}", layer,);
-                            let parents_data: Vec<<Tree::Hasher as Hasher>::Domain> = if layer == 1
-                            {
-                                let mut parents = vec![0; graph.base_graph().degree()];
-                                graph.base_parents(challenge, &mut parents)?;
+                    // Labeling Proofs Layer 1..l
+                    let mut labeling_proofs = Vec::with_capacity(num_layers);
+                    let mut encoding_proof = None;
 
-                                parents
-                                    .into_par_iter()
-                                    .map(|parent| t_aux.domain_node_at_layer(layer, parent))
-                                    .collect::<Result<_>>()?
-                            } else {
-                                let mut parents = vec![0; graph.degree()];
-                                graph.parents(challenge, &mut parents)?;
-                                let base_parents_count = graph.base_graph().degree();
+                    for layer in 1..=num_layers {
+                        trace!("  encoding proof layer {}", layer,);
+                        let parents_data: Vec<<Tree::Hasher as Hasher>::Domain> = if layer == 1 {
+                            let mut parents = vec![0; graph.base_graph().degree()];
+                            graph.base_parents(challenge, &mut parents)?;
 
-                                parents
-                                    .into_par_iter()
-                                    .enumerate()
-                                    .map(|(i, parent)| {
-                                        if i < base_parents_count {
-                                            // parents data for base parents is from the current layer
-                                            t_aux.domain_node_at_layer(layer, parent)
-                                        } else {
-                                            // parents data for exp parents is from the previous layer
-                                            t_aux.domain_node_at_layer(layer - 1, parent)
-                                        }
-                                    })
-                                    .collect::<Result<_>>()?
-                            };
+                            parents
+                                .into_par_iter()
+                                .map(|parent| t_aux.domain_node_at_layer(layer, parent))
+                                .collect::<Result<_>>()?
+                        } else {
+                            let mut parents = vec![0; graph.degree()];
+                            graph.parents(challenge, &mut parents)?;
+                            let base_parents_count = graph.base_graph().degree();
 
-                            // repeat parents
-                            let mut parents_data_full = vec![Default::default(); TOTAL_PARENTS];
-                            for chunk in parents_data_full.chunks_mut(parents_data.len()) {
-                                chunk.copy_from_slice(&parents_data[..chunk.len()]);
-                            }
+                            parents
+                                .into_par_iter()
+                                .enumerate()
+                                .map(|(i, parent)| {
+                                    if i < base_parents_count {
+                                        // parents data for base parents is from the current layer
+                                        t_aux.domain_node_at_layer(layer, parent)
+                                    } else {
+                                        // parents data for exp parents is from the previous layer
+                                        t_aux.domain_node_at_layer(layer - 1, parent)
+                                    }
+                                })
+                                .collect::<Result<_>>()?
+                        };
 
-                            let proof = LabelingProof::<Tree::Hasher>::new(
-                                layer as u32,
-                                challenge as u64,
-                                parents_data_full.clone(),
-                            );
+                        // repeat parents
+                        let mut parents_data_full = vec![Default::default(); TOTAL_PARENTS];
+                        for chunk in parents_data_full.chunks_mut(parents_data.len()) {
+                            chunk.copy_from_slice(&parents_data[..chunk.len()]);
+                        }
 
-                            {
-                                let labeled_node = rcp.c_x.get_node_at_layer(layer)?;
+                        let proof = LabelingProof::<Tree::Hasher>::new(
+                            layer as u32,
+                            challenge as u64,
+                            parents_data_full.clone(),
+                        );
+
+                        {
+                            let labeled_node = *rcp.c_x.get_node_at_layer(layer)?;
+                            let replica_id = &pub_inputs.replica_id;
+                            let proof_inner = proof.clone();
+                            scope.execute(move || {
                                 assert!(
-                                    proof.verify(&pub_inputs.replica_id, labeled_node),
+                                    proof_inner.verify(replica_id, &labeled_node),
                                     "Invalid encoding proof generated at layer {}",
                                     layer,
                                 );
                                 trace!("Valid encoding proof generated at layer {}", layer);
-                            }
-
-                            labeling_proofs.push(proof);
-
-                            if layer == layers {
-                                encoding_proof = Some(EncodingProof::new(
-                                    layer as u32,
-                                    challenge as u64,
-                                    parents_data_full,
-                                ));
-                            }
+                            });
                         }
 
-                        Ok(Proof {
-                            comm_d_proofs: comm_d_proof,
-                            replica_column_proofs: rcp,
-                            comm_r_last_proof,
-                            labeling_proofs,
-                            encoding_proof: encoding_proof.expect("invalid tapering"),
-                        })
+                        labeling_proofs.push(proof);
+
+                        if layer == num_layers {
+                            encoding_proof = Some(EncodingProof::new(
+                                layer as u32,
+                                challenge as u64,
+                                parents_data_full,
+                            ));
+                        }
+                    }
+
+                    Ok(Proof {
+                        comm_d_proofs: comm_d_proof,
+                        replica_column_proofs: rcp,
+                        comm_r_last_proof,
+                        labeling_proofs,
+                        encoding_proof: encoding_proof.expect("invalid tapering"),
                     })
-                    .collect()
-            })
-            .collect()
+                })
+                .collect()
+        })
     }
 
-    pub(crate) fn extract_and_invert_transform_layers(
+    fn write_synth_proofs(
+        synth_proofs: &[Proof<Tree, G>],
+        pub_inputs: &PublicInputs<<Tree::Hasher as Hasher>::Domain, <G as Hasher>::Domain>,
         graph: &StackedBucketGraph<Tree::Hasher>,
-        layer_challenges: &LayerChallenges,
+        challenges: &SynthChallenges,
+        num_layers: usize,
+        path: PathBuf,
+    ) -> Result<()> {
+        use crate::stacked::vanilla::challenges::synthetic::SynthChallengeGenerator;
+
+        ensure!(
+            pub_inputs.tau.is_some(),
+            "comm_r must be set prior to generating synthetic challenges",
+        );
+
+        THREAD_POOL.scoped(|scope| {
+            // Verify synth proofs prior to writing because `ProofScheme`'s verification API is not
+            // amenable to prover-only verification (i.e. the API uses public values, whereas synthetic
+            // proofs are known only to the prover).
+            let pub_params = PublicParams::<Tree>::new(
+                graph.clone(),
+                Challenges::Synth(challenges.clone()),
+                num_layers,
+            );
+            let replica_id: Fr = pub_inputs.replica_id.into();
+            let comm_r: Fr = pub_inputs
+                .tau
+                .as_ref()
+                .map(|tau| tau.comm_r.into())
+                .expect("unwrapping should not fail");
+            let synth_challenges =
+                SynthChallengeGenerator::default(graph.size(), &replica_id, &comm_r);
+            assert_eq!(synth_proofs.len(), synth_challenges.num_synth_challenges);
+            for (challenge, proof) in synth_challenges.zip(synth_proofs) {
+                let proof_inner = proof.clone();
+                let challenge_inner = challenge;
+                let pub_params_inner = pub_params.clone();
+                let pub_inputs_inner = pub_inputs.clone();
+                scope.execute(move || {
+                    assert!(proof_inner.verify(
+                        &pub_params_inner,
+                        &pub_inputs_inner,
+                        challenge_inner,
+                        graph
+                    ));
+                });
+            }
+        });
+
+        info!("writing synth-porep vanilla proofs to file: {:?}", path);
+        let file = File::create(&path).map(BufWriter::new).with_context(|| {
+            format!(
+                "failed to create synth-porep vanilla proofs file: {:?}",
+                path,
+            )
+        })?;
+        SynthProofs::write(file, synth_proofs).with_context(|| {
+            format!(
+                "failed to write synth-porep vanilla proofs to file: {:?}",
+                path,
+            )
+        })?;
+        info!(
+            "successfully stored synth-porep vanilla proofs to file: {:?}",
+            path,
+        );
+        Ok(())
+    }
+
+    fn read_porep_proofs_from_synth(
+        sector_nodes: usize,
+        pub_inputs: &PublicInputs<<Tree::Hasher as Hasher>::Domain, <G as Hasher>::Domain>,
+        challenges: &SynthChallenges,
+        num_layers: usize,
+        path: PathBuf,
+        partition_count: usize,
+    ) -> Result<Vec<Vec<Proof<Tree, G>>>> {
+        ensure!(
+            pub_inputs.seed.is_some(),
+            "porep challenge seed must be set prior to reading porep proofs from synthetic",
+        );
+        ensure!(
+            pub_inputs.tau.is_some(),
+            "comm_r must be set prior to generating synthetic porep challenges",
+        );
+
+        let seed = pub_inputs
+            .seed
+            .as_ref()
+            .expect("unwrapping should not fail");
+        let comm_r = pub_inputs
+            .tau
+            .as_ref()
+            .map(|tau| &tau.comm_r)
+            .expect("unwrapping should not fail");
+        info!("reading synthetic vanilla proofs from file: {:?}", path);
+
+        let mut file = File::open(&path)
+            .map(BufReader::new)
+            .with_context(|| format!("failed to open synthetic vanilla proofs file: {:?}", path))?;
+
+        let porep_proofs = (0..partition_count as u8)
+            .map(|k| {
+                let synth_indexes = challenges.derive_indexes(
+                    sector_nodes,
+                    &pub_inputs.replica_id,
+                    comm_r,
+                    seed,
+                    k,
+                );
+
+                SynthProofs::read(
+                    &mut file,
+                    sector_nodes,
+                    num_layers,
+                    synth_indexes.into_iter(),
+                )
+                .with_context(|| {
+                    format!(
+                        "failed to read partition k={} synthetic proofs from file: {:?}",
+                        k, path,
+                    )
+                })
+            })
+            .collect::<Result<Vec<Vec<Proof<Tree, G>>>>>()?;
+
+        info!("successfully read porep vanilla proofs from synthetic file");
+        Ok(porep_proofs)
+    }
+
+    pub fn extract_and_invert_transform_layers(
+        graph: &StackedBucketGraph<Tree::Hasher>,
+        num_layers: usize,
         replica_id: &<Tree::Hasher as Hasher>::Domain,
         data: &mut [u8],
         config: StoreConfig,
     ) -> Result<()> {
         trace!("extract_and_invert_transform_layers");
 
-        let layers = layer_challenges.layers();
-        assert!(layers > 0);
+        assert!(num_layers > 0);
 
-        let labels =
-            Self::generate_labels_for_decoding(graph, layer_challenges, replica_id, config)?;
+        let labels = Self::generate_labels_for_decoding(graph, num_layers, replica_id, config)?;
 
         let last_layer_labels = labels.labels_for_last_layer()?;
         let size = Store::len(last_layer_labels);
@@ -325,12 +579,15 @@ impl<'a, Tree: 'static + MerkleTreeTrait, G: 'static + Hasher> StackedDrg<'a, Tr
     }
 
     /// Generates the layers as needed for encoding.
-    pub fn generate_labels_for_encoding(
+    fn generate_labels_for_encoding<P>(
         graph: &StackedBucketGraph<Tree::Hasher>,
-        layer_challenges: &LayerChallenges,
+        num_layers: usize,
         replica_id: &<Tree::Hasher as Hasher>::Domain,
-        config: StoreConfig,
-    ) -> Result<(Labels<Tree>, Vec<LayerState>)> {
+        cache_path: P,
+    ) -> Result<(Labels<Tree>, Vec<LayerState>)>
+    where
+        P: AsRef<Path>,
+    {
         let mut parent_cache = graph.parent_cache()?;
 
         #[cfg(feature = "multicore-sdr")]
@@ -349,18 +606,18 @@ impl<'a, Tree: 'static + MerkleTreeTrait, G: 'static + Hasher> StackedDrg<'a, Tr
                 create_label::multi::create_labels_for_encoding(
                     graph,
                     &parent_cache,
-                    layer_challenges.layers(),
+                    num_layers,
                     replica_id,
-                    config,
+                    &cache_path,
                 )
             } else {
                 info!("single core replication");
                 create_label::single::create_labels_for_encoding(
                     graph,
                     &mut parent_cache,
-                    layer_challenges.layers(),
+                    num_layers,
                     replica_id,
-                    config,
+                    &cache_path,
                 )
             }
         }
@@ -371,9 +628,9 @@ impl<'a, Tree: 'static + MerkleTreeTrait, G: 'static + Hasher> StackedDrg<'a, Tr
             create_label::single::create_labels_for_encoding(
                 graph,
                 &mut parent_cache,
-                layer_challenges.layers(),
+                num_layers,
                 replica_id,
-                config,
+                &cache_path,
             )
         }
     }
@@ -381,7 +638,7 @@ impl<'a, Tree: 'static + MerkleTreeTrait, G: 'static + Hasher> StackedDrg<'a, Tr
     /// Generates the layers, as needed for decoding.
     pub fn generate_labels_for_decoding(
         graph: &StackedBucketGraph<Tree::Hasher>,
-        layer_challenges: &LayerChallenges,
+        num_layers: usize,
         replica_id: &<Tree::Hasher as Hasher>::Domain,
         config: StoreConfig,
     ) -> Result<LabelsCache<Tree>> {
@@ -394,7 +651,7 @@ impl<'a, Tree: 'static + MerkleTreeTrait, G: 'static + Hasher> StackedDrg<'a, Tr
                 create_label::multi::create_labels_for_decoding(
                     graph,
                     &parent_cache,
-                    layer_challenges.layers(),
+                    num_layers,
                     replica_id,
                     config,
                 )
@@ -403,7 +660,7 @@ impl<'a, Tree: 'static + MerkleTreeTrait, G: 'static + Hasher> StackedDrg<'a, Tr
                 create_label::single::create_labels_for_decoding(
                     graph,
                     &mut parent_cache,
-                    layer_challenges.layers(),
+                    num_layers,
                     replica_id,
                     config,
                 )
@@ -416,7 +673,7 @@ impl<'a, Tree: 'static + MerkleTreeTrait, G: 'static + Hasher> StackedDrg<'a, Tr
             create_label::single::create_labels_for_decoding(
                 graph,
                 &mut parent_cache,
-                layer_challenges.layers(),
+                num_layers,
                 replica_id,
                 config,
             )
@@ -427,7 +684,7 @@ impl<'a, Tree: 'static + MerkleTreeTrait, G: 'static + Hasher> StackedDrg<'a, Tr
     // storage_proofs_core::merkle::create_base_merkle_tree, this
     // method requires the data on disk to be exactly the same size as
     // the tree length / NODE_SIZE.
-    pub fn build_binary_tree<K: Hasher>(
+    fn build_binary_tree<K: Hasher>(
         tree_data: &[u8],
         config: StoreConfig,
     ) -> Result<BinaryMerkleTree<K>> {
@@ -436,7 +693,7 @@ impl<'a, Tree: 'static + MerkleTreeTrait, G: 'static + Hasher> StackedDrg<'a, Tr
         let leafs = tree_data.len() / NODE_SIZE;
         assert_eq!(tree_data.len() % NODE_SIZE, 0);
 
-        let tree = MerkleTree::from_par_iter_with_config(
+        let tree = BinaryMerkleTree::from_par_iter_with_config(
             (0..leafs)
                 .into_par_iter()
                 // TODO: proper error handling instead of `unwrap()`
@@ -446,23 +703,8 @@ impl<'a, Tree: 'static + MerkleTreeTrait, G: 'static + Hasher> StackedDrg<'a, Tr
         Ok(tree)
     }
 
-    // Even if the column builder is enabled, the GPU column builder
-    // only supports Poseidon hashes.
-    pub fn use_gpu_column_builder() -> bool {
-        SETTINGS.use_gpu_column_builder
-            && TypeId::of::<Tree::Hasher>() == TypeId::of::<PoseidonHasher>()
-    }
-
-    // Even if the tree builder is enabled, the GPU tree builder
-    // only supports Poseidon hashes.
-    pub fn use_gpu_tree_builder() -> bool {
-        SETTINGS.use_gpu_tree_builder
-            && TypeId::of::<Tree::Hasher>() == TypeId::of::<PoseidonHasher>()
-    }
-
     #[cfg(any(feature = "cuda", feature = "opencl"))]
-    fn generate_tree_c<ColumnArity, TreeArity>(
-        layers: usize,
+    pub fn generate_tree_c<ColumnArity, TreeArity>(
         nodes_count: usize,
         tree_count: usize,
         configs: Vec<StoreConfig>,
@@ -472,28 +714,20 @@ impl<'a, Tree: 'static + MerkleTreeTrait, G: 'static + Hasher> StackedDrg<'a, Tr
         ColumnArity: 'static + PoseidonArity,
         TreeArity: PoseidonArity,
     {
-        if Self::use_gpu_column_builder() {
+        if SETTINGS.use_gpu_column_builder::<Tree>() {
             Self::generate_tree_c_gpu::<ColumnArity, TreeArity>(
-                layers,
                 nodes_count,
                 tree_count,
                 configs,
                 labels,
             )
         } else {
-            Self::generate_tree_c_cpu::<ColumnArity, TreeArity>(
-                layers,
-                nodes_count,
-                tree_count,
-                configs,
-                labels,
-            )
+            Self::generate_tree_c_cpu::<ColumnArity>(nodes_count, tree_count, configs, labels)
         }
     }
 
     #[cfg(not(any(feature = "cuda", feature = "opencl")))]
-    fn generate_tree_c<ColumnArity, TreeArity>(
-        layers: usize,
+    pub fn generate_tree_c<ColumnArity, TreeArity>(
         nodes_count: usize,
         tree_count: usize,
         configs: Vec<StoreConfig>,
@@ -503,19 +737,12 @@ impl<'a, Tree: 'static + MerkleTreeTrait, G: 'static + Hasher> StackedDrg<'a, Tr
         ColumnArity: 'static + PoseidonArity,
         TreeArity: PoseidonArity,
     {
-        Self::generate_tree_c_cpu::<ColumnArity, TreeArity>(
-            layers,
-            nodes_count,
-            tree_count,
-            configs,
-            labels,
-        )
+        Self::generate_tree_c_cpu::<ColumnArity>(nodes_count, tree_count, configs, labels)
     }
 
     #[allow(clippy::needless_range_loop)]
     #[cfg(any(feature = "cuda", feature = "opencl"))]
     fn generate_tree_c_gpu<ColumnArity, TreeArity>(
-        layers: usize,
         nodes_count: usize,
         tree_count: usize,
         configs: Vec<StoreConfig>,
@@ -526,11 +753,11 @@ impl<'a, Tree: 'static + MerkleTreeTrait, G: 'static + Hasher> StackedDrg<'a, Tr
         TreeArity: PoseidonArity,
     {
         use std::cmp::min;
-        use std::sync::mpsc::sync_channel as channel;
-        use std::sync::{Arc, RwLock};
+        use std::sync::{mpsc::sync_channel as channel, Arc, RwLock};
 
         use fr32::fr_into_bytes;
         use generic_array::GenericArray;
+        use log::warn;
         use neptune::{
             batch_hasher::Batcher,
             column_tree_builder::{ColumnTreeBuilder, ColumnTreeBuilderTrait},
@@ -583,7 +810,7 @@ impl<'a, Tree: 'static + MerkleTreeTrait, G: 'static + Hasher> StackedDrg<'a, Tr
                                 let mut layer_data: Vec<Vec<u8>> =
                                     vec![
                                         vec![0u8; chunked_nodes_count * std::mem::size_of::<Fr>()];
-                                        layers
+                                        ColumnArity::to_usize()
                                     ];
 
                                 // gather all layer data.
@@ -602,7 +829,7 @@ impl<'a, Tree: 'static + MerkleTreeTrait, G: 'static + Hasher> StackedDrg<'a, Tr
                                 (0..chunked_nodes_count)
                                     .into_par_iter()
                                     .map(|index| {
-                                        (0..layers)
+                                        (0..ColumnArity::to_usize())
                                             .map(|layer_index| {
                                                 bytes_into_fr(
                                                 &layer_data[layer_index][std::mem::size_of::<Fr>()
@@ -774,8 +1001,7 @@ impl<'a, Tree: 'static + MerkleTreeTrait, G: 'static + Hasher> StackedDrg<'a, Tr
         })
     }
 
-    fn generate_tree_c_cpu<ColumnArity, TreeArity>(
-        layers: usize,
+    fn generate_tree_c_cpu<ColumnArity>(
         nodes_count: usize,
         tree_count: usize,
         configs: Vec<StoreConfig>,
@@ -783,7 +1009,6 @@ impl<'a, Tree: 'static + MerkleTreeTrait, G: 'static + Hasher> StackedDrg<'a, Tr
     ) -> Result<DiskTree<Tree::Hasher, Tree::Arity, Tree::SubTreeArity, Tree::TopTreeArity>>
     where
         ColumnArity: PoseidonArity,
-        TreeArity: PoseidonArity,
     {
         info!("generating tree c using the CPU");
         measure_op(Operation::GenerateTreeC, || {
@@ -809,7 +1034,7 @@ impl<'a, Tree: 'static + MerkleTreeTrait, G: 'static + Hasher> StackedDrg<'a, Tr
 
                         s.execute(move || {
                             for (j, hash) in hashes_chunk.iter_mut().enumerate() {
-                                let data: Vec<_> = (1..=layers)
+                                let data: Vec<_> = (1..=ColumnArity::to_usize())
                                     .map(|layer| {
                                         let store = labels.labels_for_layer(layer);
                                         let el: <Tree::Hasher as Hasher>::Domain = store
@@ -879,8 +1104,11 @@ impl<'a, Tree: 'static + MerkleTreeTrait, G: 'static + Hasher> StackedDrg<'a, Tr
         start: usize,
         end: usize,
     ) -> Result<TreeRElementData<Tree>> {
-        if Self::use_gpu_tree_builder() {
+        if SETTINGS.use_gpu_tree_builder::<Tree>() {
+            use ff::PrimeField;
             use fr32::bytes_into_fr;
+
+            use crate::encode::encode_fr;
 
             let mut layer_bytes = vec![0u8; (end - start) * std::mem::size_of::<Fr>()];
             source
@@ -927,8 +1155,50 @@ impl<'a, Tree: 'static + MerkleTreeTrait, G: 'static + Hasher> StackedDrg<'a, Tr
         Self::prepare_tree_r_data_cpu(source, data, start, end)
     }
 
+    /// Generate the TreeRLast.
+    ///
+    /// `nodes_count` is the number of nodes per sector, practically is the sector size in bytes
+    /// divided by the 32 bytes node size.
+    ///
+    /// TreeRLast is split into several sub-trees. The exact number `tree_count` depends on the
+    /// sector size.
+    ///
+    /// The `tree_r_last_config` specifies where those sub-trees are stored and what their
+    /// filenames are.
+    ///
+    /// This tree is built during the PoRep during the PreCommit2 phase as well as during the empty
+    /// sector update (aka SnapDeals). The input parameters are used differently in both cases,
+    /// therefore the next section distinguishes between those for the other parameter
+    /// descriptions.
+    ///
+    /// # PoRep TreeRLast
+    ///
+    /// When calling this function to produce the PoRep TreeRLast, several things beside the actual
+    /// tree building are happening. When calling this function, `data` points to the unsealed
+    /// data, which is then modified in-place during the execution. This means, that it's a copy
+    /// of the unsealed data at the location where the final replica will be stored. That location
+    /// is the same as the `replica_path`.
+    ///
+    /// That modification during the execution of the function is the replica encoding step. The
+    /// data for the sector key is provided by the `source`, which is the last layer of the SDR
+    /// process.
+    ///
+    /// The `callback` is `None`, this way the default callback is used, which does the encoding
+    /// step described above. In case of the GPU code path, it also transforms the field elements
+    /// into the representation needed for the GPU based tree building.
+    ///
+    /// # Empty sector update TreeRLast
+    ///
+    /// When calling this function to produce the empty sector update TreeRLast, no data is
+    /// manipulated in place. This means that the `data` parameter isn't really used, hence it's
+    /// initialized with [`Data::empty`]. The `replica_path` points to the already encoded replica
+    /// file. The `source` points to the same replica file.
+    ///
+    /// A custom `callback` is passed in. In case of the GPU code path, that callback does only
+    /// the on-the-fly transformation of the field elements for the GPU code path, it doesn't do
+    /// any further transformations.
     #[cfg(any(feature = "cuda", feature = "opencl"))]
-    pub fn generate_tree_r_last<TreeArity>(
+    pub fn generate_tree_r_last(
         data: &mut Data<'_>,
         nodes_count: usize,
         tree_count: usize,
@@ -936,17 +1206,14 @@ impl<'a, Tree: 'static + MerkleTreeTrait, G: 'static + Hasher> StackedDrg<'a, Tr
         replica_path: PathBuf,
         source: &DiskStore<<Tree::Hasher as Hasher>::Domain>,
         callback: Option<PrepareTreeRDataCallback<Tree>>,
-    ) -> Result<LCTree<Tree::Hasher, Tree::Arity, Tree::SubTreeArity, Tree::TopTreeArity>>
-    where
-        TreeArity: PoseidonArity,
-    {
+    ) -> Result<LCTree<Tree::Hasher, Tree::Arity, Tree::SubTreeArity, Tree::TopTreeArity>> {
         let encode_data = match callback {
             Some(x) => x,
             None => Self::prepare_tree_r_data,
         };
 
-        if Self::use_gpu_tree_builder() {
-            Self::generate_tree_r_last_gpu::<TreeArity>(
+        if SETTINGS.use_gpu_tree_builder::<Tree>() {
+            Self::generate_tree_r_last_gpu(
                 data,
                 nodes_count,
                 tree_count,
@@ -956,7 +1223,7 @@ impl<'a, Tree: 'static + MerkleTreeTrait, G: 'static + Hasher> StackedDrg<'a, Tr
                 encode_data,
             )
         } else {
-            Self::generate_tree_r_last_cpu::<TreeArity>(
+            Self::generate_tree_r_last_cpu(
                 data,
                 nodes_count,
                 tree_count,
@@ -969,7 +1236,7 @@ impl<'a, Tree: 'static + MerkleTreeTrait, G: 'static + Hasher> StackedDrg<'a, Tr
     }
 
     #[cfg(not(any(feature = "cuda", feature = "opencl")))]
-    pub fn generate_tree_r_last<TreeArity>(
+    pub fn generate_tree_r_last(
         data: &mut Data<'_>,
         nodes_count: usize,
         tree_count: usize,
@@ -977,16 +1244,13 @@ impl<'a, Tree: 'static + MerkleTreeTrait, G: 'static + Hasher> StackedDrg<'a, Tr
         replica_path: PathBuf,
         source: &DiskStore<<Tree::Hasher as Hasher>::Domain>,
         callback: Option<PrepareTreeRDataCallback<Tree>>,
-    ) -> Result<LCTree<Tree::Hasher, Tree::Arity, Tree::SubTreeArity, Tree::TopTreeArity>>
-    where
-        TreeArity: PoseidonArity,
-    {
+    ) -> Result<LCTree<Tree::Hasher, Tree::Arity, Tree::SubTreeArity, Tree::TopTreeArity>> {
         let encode_data = match callback {
             Some(x) => x,
             None => Self::prepare_tree_r_data,
         };
 
-        Self::generate_tree_r_last_cpu::<TreeArity>(
+        Self::generate_tree_r_last_cpu(
             data,
             nodes_count,
             tree_count,
@@ -998,7 +1262,7 @@ impl<'a, Tree: 'static + MerkleTreeTrait, G: 'static + Hasher> StackedDrg<'a, Tr
     }
 
     #[cfg(any(feature = "cuda", feature = "opencl"))]
-    fn generate_tree_r_last_gpu<TreeArity>(
+    fn generate_tree_r_last_gpu(
         data: &mut Data<'_>,
         nodes_count: usize,
         tree_count: usize,
@@ -1006,16 +1270,14 @@ impl<'a, Tree: 'static + MerkleTreeTrait, G: 'static + Hasher> StackedDrg<'a, Tr
         replica_path: PathBuf,
         source: &DiskStore<<Tree::Hasher as Hasher>::Domain>,
         callback: PrepareTreeRDataCallback<Tree>,
-    ) -> Result<LCTree<Tree::Hasher, Tree::Arity, Tree::SubTreeArity, Tree::TopTreeArity>>
-    where
-        TreeArity: PoseidonArity,
-    {
+    ) -> Result<LCTree<Tree::Hasher, Tree::Arity, Tree::SubTreeArity, Tree::TopTreeArity>> {
         use std::cmp::min;
         use std::fs::OpenOptions;
         use std::io::Write;
         use std::sync::mpsc::sync_channel as channel;
 
         use fr32::fr_into_bytes;
+        use log::warn;
         use merkletree::merkle::{get_merkle_tree_cache_size, get_merkle_tree_leafs};
         use neptune::{
             batch_hasher::Batcher,
@@ -1177,7 +1439,7 @@ impl<'a, Tree: 'static + MerkleTreeTrait, G: 'static + Hasher> StackedDrg<'a, Tr
         )
     }
 
-    fn generate_tree_r_last_cpu<TreeArity>(
+    fn generate_tree_r_last_cpu(
         data: &mut Data<'_>,
         nodes_count: usize,
         tree_count: usize,
@@ -1185,10 +1447,7 @@ impl<'a, Tree: 'static + MerkleTreeTrait, G: 'static + Hasher> StackedDrg<'a, Tr
         replica_path: PathBuf,
         source: &DiskStore<<Tree::Hasher as Hasher>::Domain>,
         callback: PrepareTreeRDataCallback<Tree>,
-    ) -> Result<LCTree<Tree::Hasher, Tree::Arity, Tree::SubTreeArity, Tree::TopTreeArity>>
-    where
-        TreeArity: PoseidonArity,
-    {
+    ) -> Result<LCTree<Tree::Hasher, Tree::Arity, Tree::SubTreeArity, Tree::TopTreeArity>> {
         let (configs, replica_config) = split_config_and_replica(
             tree_r_last_config.clone(),
             replica_path,
@@ -1247,48 +1506,21 @@ impl<'a, Tree: 'static + MerkleTreeTrait, G: 'static + Hasher> StackedDrg<'a, Tr
         )
     }
 
-    pub(crate) fn transform_and_replicate_layers(
+    fn transform_and_replicate_layers(
         graph: &StackedBucketGraph<Tree::Hasher>,
-        layer_challenges: &LayerChallenges,
-        replica_id: &<Tree::Hasher as Hasher>::Domain,
-        data: Data<'_>,
-        data_tree: Option<BinaryMerkleTree<G>>,
-        config: StoreConfig,
-        replica_path: PathBuf,
-    ) -> Result<TransformedLayers<Tree, G>> {
-        // Generate key layers.
-        let labels = measure_op(Operation::EncodeWindowTimeAll, || {
-            Self::generate_labels_for_encoding(graph, layer_challenges, replica_id, config.clone())
-                .context("failed to generate labels")
-        })?
-        .0;
-
-        Self::transform_and_replicate_layers_inner(
-            graph,
-            layer_challenges,
-            data,
-            data_tree,
-            config,
-            replica_path,
-            labels,
-        )
-        .context("failed to transform")
-    }
-
-    pub(crate) fn transform_and_replicate_layers_inner(
-        graph: &StackedBucketGraph<Tree::Hasher>,
-        layer_challenges: &LayerChallenges,
+        num_layers: usize,
         mut data: Data<'_>,
         data_tree: Option<BinaryMerkleTree<G>>,
-        config: StoreConfig,
+        // The directory where the files we operate on are stored.
+        cache_path: PathBuf,
         replica_path: PathBuf,
         label_configs: Labels<Tree>,
     ) -> Result<TransformedLayers<Tree, G>> {
         trace!("transform_and_replicate_layers");
-        let nodes_count = graph.size();
+        let total_nodes_count = graph.size();
 
-        assert_eq!(data.len(), nodes_count * NODE_SIZE);
-        trace!("nodes count {}, data len {}", nodes_count, data.len());
+        assert_eq!(data.len(), total_nodes_count * NODE_SIZE);
+        trace!("nodes count {}, data len {}", total_nodes_count, data.len());
 
         let tree_count = get_base_tree_count::<Tree>();
         let nodes_count = graph.size() / tree_count;
@@ -1309,44 +1541,43 @@ impl<'a, Tree: 'static + MerkleTreeTrait, G: 'static + Hasher> StackedDrg<'a, Tr
         );
         assert!(binary_arity_valid);
         assert!(other_arity_valid);
-
-        let layers = layer_challenges.layers();
-        assert!(layers > 0);
+        assert!(num_layers > 0);
 
         // Generate all store configs that we need based on the
         // cache_path in the specified config.
-        let mut tree_d_config = StoreConfig::from_config(
-            &config,
-            CacheKey::CommDTree.to_string(),
-            Some(get_merkle_tree_len(nodes_count, BINARY_ARITY)?),
-        );
-        tree_d_config.rows_to_discard = default_rows_to_discard(nodes_count, BINARY_ARITY);
+        let tree_d_config = StoreConfig {
+            path: cache_path.clone(),
+            id: CacheKey::CommDTree.to_string(),
+            size: Some(get_merkle_tree_len(total_nodes_count, BINARY_ARITY)?),
+            rows_to_discard: 0,
+        };
 
-        let mut tree_r_last_config = StoreConfig::from_config(
-            &config,
-            CacheKey::CommRLastTree.to_string(),
-            Some(get_merkle_tree_len(nodes_count, Tree::Arity::to_usize())?),
-        );
+        let size = Some(get_merkle_tree_len(nodes_count, Tree::Arity::to_usize())?);
 
-        // A default 'rows_to_discard' value will be chosen for tree_r_last, unless the user overrides this value via the
-        // environment setting (FIL_PROOFS_ROWS_TO_DISCARD).  If this value is specified, no checking is done on it and it may
-        // result in a broken configuration.  Use with caution.  It must be noted that if/when this unchecked value is passed
-        // through merkle_light, merkle_light now does a check that does not allow us to discard more rows than is possible
-        // to discard.
-        tree_r_last_config.rows_to_discard =
-            default_rows_to_discard(nodes_count, Tree::Arity::to_usize());
+        let tree_r_last_config = StoreConfig {
+            path: cache_path.clone(),
+            id: CacheKey::CommRLastTree.to_string(),
+            size,
+            // A default 'rows_to_discard' value will be chosen for tree_r_last, unless the
+            // `fixed-rows-to-discard` feature is not enabled and the user overrides this value
+            // via the environment setting (FIL_PROOFS_ROWS_TO_DISCARD). If this value is
+            // specified, no checking is done on it and it may result in a broken configuration.
+            // *Use with caution*. It must be noted that if/when this unchecked value is passed
+            // through merkle_light, merkle_light now does a check that does not allow us to
+            // discard more rows than is possible to discard.
+            rows_to_discard: default_rows_to_discard(nodes_count, Tree::Arity::to_usize()),
+        };
         trace!(
             "tree_r_last using rows_to_discard={}",
             tree_r_last_config.rows_to_discard
         );
 
-        let mut tree_c_config = StoreConfig::from_config(
-            &config,
-            CacheKey::CommCTree.to_string(),
-            Some(get_merkle_tree_len(nodes_count, Tree::Arity::to_usize())?),
-        );
-        tree_c_config.rows_to_discard =
-            default_rows_to_discard(nodes_count, Tree::Arity::to_usize());
+        let tree_c_config = StoreConfig {
+            path: cache_path,
+            id: CacheKey::CommCTree.to_string(),
+            size,
+            rows_to_discard: 0,
+        };
 
         let labels =
             LabelsCache::<Tree>::new(&label_configs).context("failed to create labels cache")?;
@@ -1359,20 +1590,9 @@ impl<'a, Tree: 'static + MerkleTreeTrait, G: 'static + Hasher> StackedDrg<'a, Tr
             None => error!("Failed to raise the fd limit"),
         };
 
-        let tree_c_root = match layers {
+        let tree_c_root = match num_layers {
             2 => {
                 let tree_c = Self::generate_tree_c::<U2, Tree::Arity>(
-                    layers,
-                    nodes_count,
-                    tree_count,
-                    configs,
-                    &labels,
-                )?;
-                tree_c.root()
-            }
-            8 => {
-                let tree_c = Self::generate_tree_c::<U8, Tree::Arity>(
-                    layers,
                     nodes_count,
                     tree_count,
                     configs,
@@ -1382,7 +1602,6 @@ impl<'a, Tree: 'static + MerkleTreeTrait, G: 'static + Hasher> StackedDrg<'a, Tr
             }
             11 => {
                 let tree_c = Self::generate_tree_c::<U11, Tree::Arity>(
-                    layers,
                     nodes_count,
                     tree_count,
                     configs,
@@ -1410,7 +1629,6 @@ impl<'a, Tree: 'static + MerkleTreeTrait, G: 'static + Hasher> StackedDrg<'a, Tr
                 })?
             }
         };
-        tree_d_config.size = Some(tree_d.len());
         assert_eq!(
             tree_d_config.size.expect("config size failure"),
             tree_d.len()
@@ -1424,7 +1642,7 @@ impl<'a, Tree: 'static + MerkleTreeTrait, G: 'static + Hasher> StackedDrg<'a, Tr
 
         info!("building tree_r_last");
         let tree_r_last = measure_op(Operation::GenerateTreeRLast, || {
-            Self::generate_tree_r_last::<Tree::Arity>(
+            Self::generate_tree_r_last(
                 &mut data,
                 nodes_count,
                 tree_count,
@@ -1466,19 +1684,21 @@ impl<'a, Tree: 'static + MerkleTreeTrait, G: 'static + Hasher> StackedDrg<'a, Tr
     }
 
     /// Phase1 of replication.
-    pub fn replicate_phase1(
+    pub fn replicate_phase1<P>(
         pp: &'a PublicParams<Tree>,
         replica_id: &<Tree::Hasher as Hasher>::Domain,
-        config: StoreConfig,
-    ) -> Result<Labels<Tree>> {
+        cache_path: P,
+    ) -> Result<(Labels<Tree>, Vec<LayerState>)>
+    where
+        P: AsRef<Path>,
+    {
         info!("replicate_phase1");
 
-        let labels = measure_op(Operation::EncodeWindowTimeAll, || {
-            Self::generate_labels_for_encoding(&pp.graph, &pp.layer_challenges, replica_id, config)
-        })?
-        .0;
+        let labels_and_layer_states = measure_op(Operation::EncodeWindowTimeAll, || {
+            Self::generate_labels_for_encoding(&pp.graph, pp.num_layers, replica_id, cache_path)
+        })?;
 
-        Ok(labels)
+        Ok(labels_and_layer_states)
     }
 
     /// Phase2 of replication.
@@ -1487,21 +1707,24 @@ impl<'a, Tree: 'static + MerkleTreeTrait, G: 'static + Hasher> StackedDrg<'a, Tr
         pp: &'a PublicParams<Tree>,
         label_configs: Labels<Tree>,
         data: Data<'a>,
-        data_tree: BinaryMerkleTree<G>,
-        config: StoreConfig,
+        data_tree: Option<BinaryMerkleTree<G>>,
+        cache_path: PathBuf,
         replica_path: PathBuf,
     ) -> Result<(
-        <Self as PoRep<'a, Tree::Hasher, G>>::Tau,
-        <Self as PoRep<'a, Tree::Hasher, G>>::ProverAux,
+        Tau<<Tree::Hasher as Hasher>::Domain, <G as Hasher>::Domain>,
+        (
+            PersistentAux<<Tree::Hasher as Hasher>::Domain>,
+            TemporaryAux<Tree, G>,
+        ),
     )> {
         info!("replicate_phase2");
 
-        let (tau, paux, taux) = Self::transform_and_replicate_layers_inner(
+        let (tau, paux, taux) = Self::transform_and_replicate_layers(
             &pp.graph,
-            &pp.layer_challenges,
+            pp.num_layers,
             data,
-            Some(data_tree),
-            config,
+            data_tree,
+            cache_path,
             replica_path,
             label_configs,
         )?;
@@ -1513,20 +1736,17 @@ impl<'a, Tree: 'static + MerkleTreeTrait, G: 'static + Hasher> StackedDrg<'a, Tr
     // Replica path is used to create configs, but is not read.
     // Instead new zeros are provided (hence the need for replica to be all zeros).
     #[cfg(any(feature = "cuda", feature = "opencl"))]
-    fn generate_fake_tree_r_last<TreeArity>(
+    fn generate_fake_tree_r_last(
         nodes_count: usize,
         tree_count: usize,
         tree_r_last_config: StoreConfig,
         replica_path: PathBuf,
-    ) -> Result<LCTree<Tree::Hasher, Tree::Arity, Tree::SubTreeArity, Tree::TopTreeArity>>
-    where
-        TreeArity: PoseidonArity,
-    {
-        use std::fs::OpenOptions;
-        use std::io::Write;
+    ) -> Result<LCTree<Tree::Hasher, Tree::Arity, Tree::SubTreeArity, Tree::TopTreeArity>> {
+        use std::{fs::OpenOptions, io::Write};
 
         use ff::Field;
         use fr32::fr_into_bytes;
+        use log::warn;
         use merkletree::merkle::{get_merkle_tree_cache_size, get_merkle_tree_leafs};
         use neptune::{
             batch_hasher::Batcher,
@@ -1540,7 +1760,7 @@ impl<'a, Tree: 'static + MerkleTreeTrait, G: 'static + Hasher> StackedDrg<'a, Tr
             tree_count,
         )?;
 
-        if Self::use_gpu_tree_builder() {
+        if SETTINGS.use_gpu_tree_builder::<Tree>() {
             info!("generating tree r last using the GPU");
             let max_gpu_tree_batch_size = SETTINGS.max_gpu_tree_batch_size as usize;
 
@@ -1560,7 +1780,7 @@ impl<'a, Tree: 'static + MerkleTreeTrait, G: 'static + Hasher> StackedDrg<'a, Tr
             .expect("failed to create TreeBuilder");
 
             // Allocate zeros once and reuse.
-            let zero_leaves: Vec<Fr> = vec![Fr::zero(); max_gpu_tree_batch_size];
+            let zero_leaves: Vec<Fr> = vec![Fr::ZERO; max_gpu_tree_batch_size];
             for (i, config) in configs.iter().enumerate() {
                 let mut consumed = 0;
                 while consumed < nodes_count {
@@ -1648,15 +1868,12 @@ impl<'a, Tree: 'static + MerkleTreeTrait, G: 'static + Hasher> StackedDrg<'a, Tr
     // Replica path is used to create configs, but is not read.
     // Instead new zeros are provided (hence the need for replica to be all zeros).
     #[cfg(not(any(feature = "cuda", feature = "opencl")))]
-    fn generate_fake_tree_r_last<TreeArity>(
+    fn generate_fake_tree_r_last(
         nodes_count: usize,
         tree_count: usize,
         tree_r_last_config: StoreConfig,
         replica_path: PathBuf,
-    ) -> Result<LCTree<Tree::Hasher, Tree::Arity, Tree::SubTreeArity, Tree::TopTreeArity>>
-    where
-        TreeArity: PoseidonArity,
-    {
+    ) -> Result<LCTree<Tree::Hasher, Tree::Arity, Tree::SubTreeArity, Tree::TopTreeArity>> {
         let (configs, replica_config) = split_config_and_replica(
             tree_r_last_config.clone(),
             replica_path,
@@ -1701,20 +1918,16 @@ impl<'a, Tree: 'static + MerkleTreeTrait, G: 'static + Hasher> StackedDrg<'a, Tr
         let tree_count = get_base_tree_count::<Tree>();
         let nodes_count = leaf_count / tree_count;
 
-        let config = StoreConfig::new(
-            cache_path.as_ref(),
-            CacheKey::CommRLastTree.to_string(),
-            default_rows_to_discard(nodes_count, Tree::Arity::to_usize()),
-        );
-        let tree_r_last_config = StoreConfig::from_config(
-            &config,
-            CacheKey::CommRLastTree.to_string(),
-            Some(get_merkle_tree_len(nodes_count, Tree::Arity::to_usize())?),
-        );
+        let tree_r_last_config = StoreConfig {
+            path: cache_path.as_ref().into(),
+            id: CacheKey::CommRLastTree.to_string(),
+            size: Some(get_merkle_tree_len(nodes_count, Tree::Arity::to_usize())?),
+            rows_to_discard: default_rows_to_discard(nodes_count, Tree::Arity::to_usize()),
+        };
 
         // Encode original data into the last layer.
         info!("building tree_r_last");
-        let tree_r_last = Self::generate_fake_tree_r_last::<Tree::Arity>(
+        let tree_r_last = Self::generate_fake_tree_r_last(
             nodes_count,
             tree_count,
             tree_r_last_config,

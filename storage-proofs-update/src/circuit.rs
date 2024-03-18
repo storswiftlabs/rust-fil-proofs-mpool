@@ -21,8 +21,8 @@ use storage_proofs_core::{
 
 use crate::{
     constants::{
-        apex_leaf_count, challenge_count, hs, partition_count, validate_tree_r_shape, TreeD,
-        TreeDArity, TreeDDomain, TreeDHasher, TreeRDomain, TreeRHasher,
+        apex_leaf_count, challenge_count, h_select, hs, partition_count, validate_tree_r_shape,
+        TreeD, TreeDArity, TreeDDomain, TreeDHasher, TreeRDomain, TreeRHasher,
         POSEIDON_CONSTANTS_GEN_RANDOMNESS,
     },
     gadgets::{apex_por, gen_challenge_bits, get_challenge_high_bits, label_r_new},
@@ -58,12 +58,7 @@ impl PublicInputs {
             "partition-index `k` exceeds partition-count for sector-size"
         );
 
-        let hs_index = hs(sector_nodes)
-            .iter()
-            .position(|h_allowed| *h_allowed == h)
-            .expect("invalid `h` for sector-size");
-
-        let h_select = 1u64 << hs_index;
+        let h_select = h_select(sector_nodes, h);
 
         let partition_bit_len = partition_count.trailing_zeros() as usize;
         let k_and_h_select = (k as u64) | (h_select << partition_bit_len);
@@ -451,7 +446,7 @@ where
                 .collect::<Result<Vec<AllocatedBit>, SynthesisError>>()?;
 
             let mut lc = LinearCombination::<Fr>::zero();
-            let mut pow2 = Fr::one();
+            let mut pow2 = Fr::ONE;
             for bit in k_and_h_select_bits.iter() {
                 lc = lc + (pow2, bit.get_variable());
                 pow2 = pow2.double();

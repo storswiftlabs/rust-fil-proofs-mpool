@@ -1,6 +1,7 @@
 use std::convert::TryInto;
 use std::marker::PhantomData;
 use std::mem::{self, size_of};
+use std::path::Path;
 use std::sync::{
     atomic::{AtomicU64, Ordering::SeqCst},
     Arc, MutexGuard,
@@ -68,7 +69,7 @@ fn fill_buffer(
 
     // Perform the first hash
     let cur_node_ptr =
-        unsafe { &mut layer_labels.as_mut_slice()[cur_node as usize * NODE_WORDS as usize..] };
+        unsafe { &mut layer_labels.as_mut_slice()[cur_node as usize * NODE_WORDS..] };
 
     cur_node_ptr[..8].copy_from_slice(&SHA256_INITIAL_DIGEST);
     compress256!(cur_node_ptr, buf, 1);
@@ -178,7 +179,7 @@ fn create_label_runner(
             let buf = unsafe { ring_buf.slot_mut(cur_slot as usize) };
             let bpm = unsafe { base_parent_missing.get_mut(cur_slot as usize) };
 
-            let pc = unsafe { parents_cache.slice_at(cur_node as usize * DEGREE as usize) };
+            let pc = unsafe { parents_cache.slice_at(cur_node as usize * DEGREE) };
             fill_buffer(
                 cur_node,
                 parents_cache,
@@ -436,16 +437,20 @@ fn create_layer_labels(
 }
 
 #[allow(clippy::type_complexity)]
-pub fn create_labels_for_encoding<Tree: 'static + MerkleTreeTrait, T: AsRef<[u8]>>(
+pub fn create_labels_for_encoding<
+    Tree: 'static + MerkleTreeTrait,
+    T: AsRef<[u8]>,
+    P: AsRef<Path>,
+>(
     graph: &StackedBucketGraph<Tree::Hasher>,
     parents_cache: &ParentCache,
     layers: usize,
     replica_id: T,
-    config: StoreConfig,
+    cache_path: P,
 ) -> Result<(Labels<Tree>, Vec<LayerState>)> {
     info!("create labels");
 
-    let layer_states = prepare_layers::<Tree>(graph, &config, layers);
+    let layer_states = prepare_layers::<_, Tree>(graph, &cache_path, layers);
 
     let sector_size = graph.size() * NODE_SIZE;
     let node_count = graph.size() as u64;
@@ -467,7 +472,7 @@ pub fn create_labels_for_encoding<Tree: 'static + MerkleTreeTrait, T: AsRef<[u8]
     let (parents_cache, mut layer_labels, mut exp_labels) = setup_create_label_memory(
         sector_size,
         DEGREE,
-        Some(default_cache_size as usize),
+        Some(default_cache_size),
         &parents_cache.path,
     )?;
 
@@ -565,7 +570,7 @@ pub fn create_labels_for_decoding<Tree: 'static + MerkleTreeTrait, T: AsRef<[u8]
     let (parents_cache, mut layer_labels, mut exp_labels) = setup_create_label_memory(
         sector_size,
         DEGREE,
-        Some(default_cache_size as usize),
+        Some(default_cache_size),
         &parents_cache.path,
     )?;
 
@@ -754,6 +759,6 @@ mod tests {
             .read_at(final_labels.len() - 1)
             .expect("read_at");
         dbg!(&last_label);
-        assert_eq!(expected_last_label.to_repr(), last_label.0);
+        assert_eq!(expected_last_label.to_repr(), last_label.as_ref());
     }
 }

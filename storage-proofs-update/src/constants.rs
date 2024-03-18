@@ -11,7 +11,7 @@ use neptune::{
     poseidon::PoseidonConstants,
     Strength,
 };
-use storage_proofs_core::merkle::{BinaryMerkleTree, LCStore, LCTree, MerkleTreeTrait};
+use storage_proofs_core::merkle::{BinaryMerkleTree, LCTree, MerkleTreeTrait};
 
 // Use a custom domain separation tag when generating randomness phi, rho, and challenges bits.
 pub const HASH_TYPE_GEN_RANDOMNESS: HashType<Fr, U2> = HashType::Custom(CType::Arbitrary(1));
@@ -58,7 +58,6 @@ pub type TreeDArity = U2;
 
 pub type TreeRHasher = PoseidonHasher;
 pub type TreeRDomain = PoseidonDomain;
-pub type TreeRStore = LCStore<TreeRDomain>;
 // All valid TreeR's have the same base-tree shape.
 pub type TreeRBaseTree = LCTree<TreeRHasher, U8, U0, U0>;
 
@@ -90,15 +89,37 @@ pub const fn challenge_count_poseidon(sector_nodes: usize) -> usize {
     challenge_count(sector_nodes) * partition_count(sector_nodes)
 }
 
-// Returns the `h` values allowed for the given sector-size. Each `h` value is a possible number of
-// high bits taken from each challenge `c`. A single value of `h = hs[i]` is taken from `hs` for
-// each proof; the circuit takes `h_select = 2^i` as a public input.
+/// Returns the `h` values allowed for the given sector-size. Each `h` value is a possible number
+/// of high bits taken from each challenge `c`. A single value of `h = hs[i]` is taken from `hs`
+/// for each proof; the circuit takes `h_select = 2^i` as a public input.
+///
+/// Those values are hard-coded for the circuit and cannot be changed without another trusted
+/// setup.
 pub const fn hs(sector_nodes: usize) -> [usize; 6] {
     if sector_nodes <= SECTOR_SIZE_32_KIB {
         [1; 6]
     } else {
         [7, 8, 9, 10, 11, 12]
     }
+}
+
+/// Returns the `h` for the given sector-size. The `h` value is the number of high bits taken from
+/// each challenge `c`. For production use, it was determined to use the value at index 3, which
+/// translates to a value of 10 for production sector sizes.
+pub const fn h_default(sector_nodes: usize) -> usize {
+    hs(sector_nodes)[3]
+}
+
+/// Returns the bit pattern to select the `h` value from the list of hard-coded `h` values within
+/// the circuit.
+pub fn h_select(sector_nodes: usize, h: usize) -> u64 {
+    // The list of possible `h` values is hard-coded in the circuit, hence their index instead of
+    // the actual values can be used within the circuit.
+    let h_index = hs(sector_nodes)
+        .iter()
+        .position(|h_allowed| *h_allowed == h)
+        .expect("invalid `h` for sector-size");
+    1u64 << h_index
 }
 
 // The number of leafs in each partition's apex-tree.

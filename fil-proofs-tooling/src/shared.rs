@@ -1,14 +1,14 @@
 use std::cmp::min;
 use std::fs::File;
-use std::io::{BufWriter, Seek, SeekFrom, Write};
+use std::io::{BufWriter, Seek, Write};
 
 use filecoin_proofs::{
-    add_piece, fauxrep_aux, seal_pre_commit_phase1, seal_pre_commit_phase2,
-    validate_cache_for_precommit_phase2, MerkleTreeTrait, PaddedBytesAmount, PieceInfo,
-    PoRepConfig, PoRepProofPartitions, PrivateReplicaInfo, PublicReplicaInfo, SealPreCommitOutput,
-    SealPreCommitPhase1Output, SectorSize, UnpaddedBytesAmount, POREP_PARTITIONS,
+    add_piece, clear_cache, fauxrep_aux, generate_synth_proofs, seal_pre_commit_phase1,
+    seal_pre_commit_phase2, validate_cache_for_commit, validate_cache_for_precommit_phase2,
+    MerkleTreeTrait, PaddedBytesAmount, PieceInfo, PoRepConfig, PrivateReplicaInfo,
+    PublicReplicaInfo, SealPreCommitOutput, SealPreCommitPhase1Output, SectorSize,
+    UnpaddedBytesAmount,
 };
-use generic_array::typenum::Unsigned;
 use log::info;
 use merkletree::store::StoreConfig;
 use rand::{random, thread_rng, RngCore};
@@ -16,9 +16,9 @@ use rayon::prelude::{
     IndexedParallelIterator, IntoParallelIterator, IntoParallelRefIterator, ParallelIterator,
 };
 use storage_proofs_core::{
-    api_version::ApiVersion,
+    api_version::{ApiFeature, ApiVersion},
     sector::SectorId,
-    util::{default_rows_to_discard, NODE_SIZE},
+    util::NODE_SIZE,
 };
 use storage_proofs_porep::stacked::Labels;
 use tempfile::{tempdir, NamedTempFile};
@@ -70,7 +70,7 @@ pub fn create_piece(piece_bytes: UnpaddedBytesAmount, use_random: bool) -> Named
         .expect("failed to sync piece file");
 
     file.as_file_mut()
-        .seek(SeekFrom::Start(0))
+        .rewind()
         .expect("failed to seek to beginning of piece file");
 
     file
@@ -79,17 +79,17 @@ pub fn create_piece(piece_bytes: UnpaddedBytesAmount, use_random: bool) -> Named
 /// Create a replica for a single sector
 pub fn create_replica<Tree: 'static + MerkleTreeTrait>(
     sector_size: u64,
-    porep_id: [u8; 32],
     fake_replica: bool,
     api_version: ApiVersion,
+    api_features: Vec<ApiFeature>,
 ) -> (SectorId, PreCommitReplicaOutput<Tree>) {
     let (_porep_config, result) = create_replicas::<Tree>(
         SectorSize(sector_size),
         1,
         false,
         fake_replica,
-        porep_id,
         api_version,
+        api_features,
     );
     // Extract the sector ID and replica output out of the result
     result
@@ -105,8 +105,8 @@ pub fn create_replicas<Tree: 'static + MerkleTreeTrait>(
     qty_sectors: usize,
     only_add: bool,
     fake_replicas: bool,
-    porep_id: [u8; 32],
     api_version: ApiVersion,
+    api_features: Vec<ApiFeature>,
 ) -> (
     PoRepConfig,
     Option<(
@@ -118,18 +118,7 @@ pub fn create_replicas<Tree: 'static + MerkleTreeTrait>(
     let sector_size_unpadded_bytes_ammount =
         UnpaddedBytesAmount::from(PaddedBytesAmount::from(sector_size));
 
-    let porep_config = PoRepConfig {
-        sector_size,
-        partitions: PoRepProofPartitions(
-            *POREP_PARTITIONS
-                .read()
-                .expect("poisoned read access")
-                .get(&u64::from(sector_size))
-                .expect("unknown sector size"),
-        ),
-        porep_id,
-        api_version,
-    };
+    let porep_config = get_porep_config(u64::from(sector_size), api_version, api_features);
 
     let mut out: Vec<(SectorId, PreCommitReplicaOutput<Tree>)> = Default::default();
     let mut sector_ids = Vec::new();
@@ -197,12 +186,8 @@ pub fn create_replicas<Tree: 'static + MerkleTreeTrait>(
                 .par_iter()
                 .zip(sector_ids.par_iter())
                 .map(|(cache_dir, sector_id)| {
-                    let nodes = sector_size.0 as usize / NODE_SIZE;
-                    let mut tmp_store_config = StoreConfig::new(
-                        &cache_dir.path(),
-                        format!("tmp-config-{}", sector_id),
-                        default_rows_to_discard(nodes, Tree::Arity::to_usize()),
-                    );
+                    let mut tmp_store_config =
+                        StoreConfig::new(cache_dir.path(), format!("tmp-config-{}", sector_id), 0);
                     tmp_store_config.size = Some(u64::from(sector_size) as usize / NODE_SIZE);
                     let f = File::create(StoreConfig::data_path(
                         &tmp_store_config.path,
@@ -231,7 +216,7 @@ pub fn create_replicas<Tree: 'static + MerkleTreeTrait>(
                     )?;
                     let comm_r = fauxrep_aux::<_, _, _, Tree>(
                         &mut rng,
-                        porep_config,
+                        &porep_config,
                         &cache_dirs[i].path(),
                         &sealed_files[i],
                     )?;
@@ -251,7 +236,7 @@ pub fn create_replicas<Tree: 'static + MerkleTreeTrait>(
                 .map(
                     |((((cache_dir, staged_file), sealed_file), sector_id), piece_infos)| {
                         seal_pre_commit_phase1(
-                            porep_config,
+                            &porep_config,
                             cache_dir,
                             staged_file,
                             sealed_file,
@@ -273,7 +258,35 @@ pub fn create_replicas<Tree: 'static + MerkleTreeTrait>(
                         &sealed_files[i],
                         &phase1,
                     )?;
-                    seal_pre_commit_phase2(porep_config, phase1, &cache_dirs[i], &sealed_files[i])
+                    let res = seal_pre_commit_phase2(
+                        &porep_config,
+                        phase1,
+                        &cache_dirs[i],
+                        &sealed_files[i],
+                    )?;
+
+                    if porep_config.feature_enabled(ApiFeature::SyntheticPoRep) {
+                        info!("SyntheticPoRep is enabled");
+                        generate_synth_proofs::<std::path::PathBuf, Tree>(
+                            &porep_config,
+                            cache_dirs[i].path().to_path_buf(),
+                            sealed_files[i].clone(),
+                            PROVER_ID,
+                            sector_ids[i],
+                            TICKET_BYTES,
+                            res.clone(),
+                            piece_infos[i].as_slice(),
+                        )
+                        .expect("failed to generate synthetic proofs");
+                        clear_cache::<Tree>(cache_dirs[i].path())
+                            .expect("failed to clear synthetic porep layer data");
+                    } else {
+                        info!("SyntheticPoRep is NOT enabled");
+                        validate_cache_for_commit::<_, _, Tree>(&cache_dirs[i], &sealed_files[i])
+                            .expect("failed to validate_cache_for_commit");
+                    }
+
+                    Ok(res)
                 })
                 .collect::<Result<Vec<_>, _>>()
         }
@@ -317,4 +330,14 @@ pub fn create_replicas<Tree: 'static + MerkleTreeTrait>(
     }
 
     (porep_config, Some((out, seal_pre_commit_outputs)))
+}
+
+pub fn get_porep_config(
+    sector_size: u64,
+    api_version: ApiVersion,
+    features: Vec<ApiFeature>,
+) -> PoRepConfig {
+    let arbitrary_porep_id = [99; 32];
+    PoRepConfig::new_groth16_with_features(sector_size, arbitrary_porep_id, api_version, features)
+        .expect("cannot set PoRep config")
 }
